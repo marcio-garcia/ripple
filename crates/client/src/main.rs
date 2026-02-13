@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use common::{TrafficClass, pack_data_packet};
+use common::{TYPE_DATA, TrafficClass, pack_data_packet};
 
 struct TerminalGuard;
 
@@ -113,7 +113,8 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
             // Now safe to pop
             queue.pop_front();
 
-            let pkt = pack_data_packet(seq, front.class, client_start, front.declared_bytes);
+            let pkt = pack_data_packet(seq, TYPE_DATA, front.class, client_start, front.declared_bytes);
+            // let pkt = pack_data_packet(seq, front.class, client_start, front.declared_bytes);
             let _ = socket.send_to(&pkt, server_addr); // ignore WouldBlock
             seq = seq.wrapping_add(1);
         }
