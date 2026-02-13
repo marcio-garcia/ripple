@@ -10,6 +10,7 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use common::{TrafficClass, pack_data_packet};
 
 struct TerminalGuard;
 
@@ -39,15 +40,6 @@ fn main() -> Result<()> {
     result
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
-enum TrafficClass {
-    _Api = 0,
-    _HeavyCompute = 1,
-    Background = 2,
-    HealthCheck = 3,
-}
-
 enum InputCommand {
     SendSingle,
     SendBurst,
@@ -61,10 +53,6 @@ struct ScheduledSend {
     class: TrafficClass,
     declared_bytes: u32,
 }
-
-const MAGIC: u32 = 0x4A4E4554; // 'JNET'
-const VERSION: u8 = 1;
-const TYPE_DATA: u8 = 1;
 
 fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
     let mut burst_count: u32 = 200;
@@ -161,22 +149,6 @@ fn handle_input(key: KeyCode) -> Option<InputCommand> {
 fn open_socket() -> Result<UdpSocket>{
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     Ok(socket)
-}
-
-fn pack_data_packet(seq: u32, class: TrafficClass, client_start: Instant, declared_bytes: u32) -> [u8; 24] {
-    let ts_us: u64 = client_start.elapsed().as_micros() as u64;
-
-    let mut buf = [0u8; 24];
-    buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    buf[4] = VERSION;
-    buf[5] = TYPE_DATA;
-    buf[6] = class as u8;
-    buf[7] = 0; // flags
-
-    buf[8..12].copy_from_slice(&seq.to_le_bytes());
-    buf[12..20].copy_from_slice(&ts_us.to_le_bytes());
-    buf[20..24].copy_from_slice(&declared_bytes.to_le_bytes());
-    buf
 }
 
 fn schedule_burst(
