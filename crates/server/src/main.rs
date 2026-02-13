@@ -1,6 +1,8 @@
 use std::{io::Result, net::UdpSocket};
 use common::{MAGIC, parse_packet};
 
+pub mod analytics;
+
 fn main() -> Result<()>{
     let socket = UdpSocket::bind("127.0.0.1:8080").expect("Couldn't bind to socket");
     println!("Server listening on 8080...");
