@@ -1,6 +1,7 @@
 use std::{fmt::Display, time::Instant};
 
 pub mod ack;
+pub mod analytics;
 
 pub const MAGIC: u32 = 0x4A4E4554; // 'JNET'
 pub const TYPE_DATA: u8 = 1;

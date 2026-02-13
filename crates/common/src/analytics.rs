@@ -1,0 +1,107 @@
+use serde::{Serialize, Deserialize};
+
+/// Top-level analytics snapshot sent to visualizer
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AnalyticsSnapshot {
+    /// Absolute timestamp when snapshot was taken (microseconds since epoch would be better, but using relative for simplicity)
+    pub snapshot_timestamp_us: u64,
+
+    /// How long the server has been running
+    pub server_uptime_us: u64,
+
+    /// Global aggregate statistics
+    pub global_stats: GlobalStats,
+
+    /// Per-client breakdown
+    pub per_client_stats: Vec<ClientStats>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GlobalStats {
+    /// Total packets received across all clients
+    pub total_packets: u64,
+
+    /// Total bytes received across all clients
+    pub total_bytes: u64,
+
+    /// Packets broken down by traffic class [Api, HeavyCompute, Background, HealthCheck]
+    pub packets_by_class: [u64; 4],
+
+    /// Bytes broken down by traffic class
+    pub bytes_by_class: [u64; 4],
+
+    /// Number of unique client addresses seen
+    pub unique_clients: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientStats {
+    /// Client address as string (e.g., "127.0.0.1:52341")
+    pub addr: String,
+
+    /// When this client first sent a packet (relative to server start, in microseconds)
+    pub first_seen_us: u64,
+
+    /// When this client last sent a packet (relative to server start)
+    pub last_seen_us: u64,
+
+    /// How long this client has been active
+    pub session_duration_us: u64,
+
+    /// Statistics broken down by traffic class
+    pub class_stats: [ClassStats; 4],
+
+    /// Latency measurements (RTT and jitter)
+    pub latency: LatencyMetrics,
+
+    /// Packet loss detection results
+    pub loss: LossMetrics,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+pub struct ClassStats {
+    /// Total packets received for this class
+    pub packets: u64,
+
+    /// Total bytes received for this class
+    pub bytes: u64,
+
+    /// Current rate (5-second sliding window)
+    pub packets_per_second: f64,
+
+    /// Current bandwidth (5-second sliding window)
+    pub bytes_per_second: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+pub struct LatencyMetrics {
+    /// Minimum RTT observed (microseconds)
+    pub min_rtt_us: u64,
+
+    /// Maximum RTT observed (microseconds)
+    pub max_rtt_us: u64,
+
+    /// Average RTT (mean)
+    pub mean_rtt_us: f64,
+
+    /// Average jitter (mean absolute difference between consecutive RTTs)
+    pub mean_jitter_us: f64,
+
+    /// Number of RTT samples collected
+    pub samples: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct LossMetrics {
+    /// Total number of missing packets detected
+    pub missing_sequences: u64,
+
+    /// Number of out-of-order packets
+    pub out_of_order: u64,
+
+    /// Number of duplicate packets
+    pub duplicates: u64,
+
+    /// Number of gaps in sequence (each gap may contain multiple missing packets)
+    pub total_gaps: usize,
+}
