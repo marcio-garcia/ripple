@@ -1,3 +1,4 @@
+use std::env;
 use std::io::{Result, stdout};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use crate::input::{execute_command, handle_input};
-use crate::transmission::{ClientState, receive_acks, receive_analytics, send_continuous_packets, send_scheduled_packets};
+use crate::transmission::{ClientState, receive_acks, send_continuous_packets, send_scheduled_packets};
 
 mod input;
 mod transmission;
@@ -25,22 +26,39 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> Result<()> {
+    let mut server_addr = String::from("127.0.0.1");
+    let mut port = String::from("");
+    let args: Vec<String> = env::args().collect();
+    println!("Program path: {}", args[0]);
+
+    for (idx, arg) in args.iter().enumerate() {
+        if idx >= args.len() { continue; }
+        match arg.as_str() {
+            "-s" => { server_addr = args[idx + 1].clone(); }
+            "-p" => { port = args[idx + 1].clone(); }
+            _ => {}
+        }
+    }
+
+    server_addr = format!("{}:{}", server_addr, port);
+
     terminal::enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
 
     let _guard = TerminalGuard;
 
-    println!("Network Traffic simulator");
+    print!("Network Traffic simulator");
     stdout.execute(MoveToNextLine(1))?;
-    println!("Stats: [waiting for ACKs...]");  // ← Add this line
+    print!("Send to: {}", &server_addr);
     stdout.execute(MoveToNextLine(1))?;
-    println!("Commands: Space=send | B=burst | 1-9=count | Q=quit");
+    print!("Commands: Space=send | B=burst | 1-9=count | Q=quit");
+    stdout.execute(MoveToNextLine(1))?;
+    print!("Stats: [waiting for ACKs...]");  // ← Add this line
 
     let socket = open_socket().expect("Couldn't open socket");
     socket.set_nonblocking(true).expect("error on non blocking");
-    let server_addr = "127.0.0.1:8080";
-    let result = run_app(socket, server_addr);
+    let result = run_app(socket, &server_addr);
 
 
     result
@@ -76,13 +94,10 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
         send_scheduled_packets(&mut state, &socket, server_addr, Instant::now())?;
 
         // Send continuous packets (if in continuous mode)
-        send_continuous_packets(&mut state, &socket, server_addr)?;  // ← Add this
+        send_continuous_packets(&mut state, &socket, server_addr)?;
 
-        // Receive ACKs
+        // Receive ACKs and analytics
         receive_acks(&mut state, &socket)?;
-
-        // Receive analytics (if requested)
-        receive_analytics(&socket)?;  // ← Add this
 
         std::thread::sleep(Duration::from_millis(1));
     }

@@ -1,12 +1,28 @@
-use std::{io::Result, net::UdpSocket, time::Instant};
+use std::{env, io::Result, net::UdpSocket, time::Instant};
 use common::{MAGIC, TYPE_DATA, TYPE_REQUEST_ANALYTICS, parse_packet};
 use crate::analytics::AnalyticsManager;
 
 pub mod analytics;
 
 fn main() -> Result<()>{
-    let socket = UdpSocket::bind("127.0.0.1:8080").expect("Couldn't bind to socket");
-    println!("Server listening on 8080...");
+    let mut server_addr = String::from("127.0.0.1");
+    let mut port = String::from("8080");
+    let args: Vec<String> = env::args().collect();
+    println!("Program path: {}", args[0]);
+
+    for (idx, arg) in args.iter().enumerate() {
+        if idx >= args.len() { continue; }
+        match arg.as_str() {
+            "-s" => { server_addr = args[idx + 1].clone(); }
+            "-p" => { port = args[idx + 1].clone(); }
+            _ => {}
+        }
+    }
+
+    server_addr = format!("{}:{}", server_addr, port);
+
+    let socket = UdpSocket::bind(server_addr).expect("Couldn't bind to socket");
+    println!("Server listening on {}...", port);
 
     let mut analytics = AnalyticsManager::new(5, 1000);  // 5-sec window, max 1000 clients
     let mut buf = [0u8; 1024];

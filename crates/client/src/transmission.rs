@@ -113,39 +113,50 @@ pub fn receive_acks(
     state: &mut ClientState,
     socket: &UdpSocket,
 ) -> Result<()> {
-    let mut ack_buf = [0u8; 64];
+    let mut buf = [0u8; 8192];  // Large enough for both ACKs and analytics
 
     loop {
-        match socket.recv_from(&mut ack_buf) {
+        match socket.recv_from(&mut buf) {
             Ok((amt, _src)) => {
-                if let Some(ack) = common::ack::parse_ack_packet(&ack_buf[..amt]) {
-                    if let Some(send_time) = state.pending_acks.remove(&ack.original_seq) {
-                        let rtt = Instant::now() - send_time;
+                // Check packet size to distinguish ACKs from analytics
+                if amt == 40 {
+                    // ACK packet
+                    if let Some(ack) = common::ack::parse_ack_packet(&buf[..amt]) {
+                        if let Some(send_time) = state.pending_acks.remove(&ack.original_seq) {
+                            let rtt = Instant::now() - send_time;
 
-                        state.total_acks += 1;
-                        state.min_rtt = state.min_rtt.min(rtt);
-                        state.max_rtt = state.max_rtt.max(rtt);
-                        state.sum_rtt += rtt;
+                            state.total_acks += 1;
+                            state.min_rtt = state.min_rtt.min(rtt);
+                            state.max_rtt = state.max_rtt.max(rtt);
+                            state.sum_rtt += rtt;
 
-                        // Display RTT on fixed line
-                        let mut out = stdout();
-                        out.execute(cursor::SavePosition)?;
-                        out.execute(cursor::MoveTo(0, 1))?;  // Move to stats line
-                        out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
-                        print!(
-                            "Stats: ACK seq={:5} | RTT={:4}µs | min={:4} max={:4} avg={:4}",
-                            ack.original_seq,
-                            rtt.as_micros(),
-                            state.min_rtt.as_micros(),
-                            state.max_rtt.as_micros(),
-                            (state.sum_rtt.as_micros() / state.total_acks as u128)
-                        );
-                        out.execute(cursor::RestorePosition)?;                    }
+                            // Display RTT on fixed line
+                            let mut out = stdout();
+                            out.execute(cursor::SavePosition)?;
+                            out.execute(cursor::MoveTo(0, 2))?;  // Move to stats line
+                            out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
+                            print!(
+                                "Stats: ACK seq={:5} | RTT={:4}µs | min={:4} max={:4} avg={:4}",
+                                ack.original_seq,
+                                rtt.as_micros(),
+                                state.min_rtt.as_micros(),
+                                state.max_rtt.as_micros(),
+                                (state.sum_rtt.as_micros() / state.total_acks as u128)
+                            );
+                            out.execute(cursor::RestorePosition)?;
+                        }
+                    }
+                } else if amt > 100 {
+                    // Analytics packet (postcard serialized, typically hundreds/thousands of bytes)
+                    if let Ok(snapshot) = postcard::from_bytes::<common::analytics::AnalyticsSnapshot>(&buf[..amt]) {
+                        display_analytics(&snapshot);
+                    }
                 }
+                // Ignore other packet sizes
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
-                eprintln!("Error receiving ACK: {}", e);
+                eprintln!("Error receiving: {}", e);
                 break;
             }
         }
@@ -184,68 +195,56 @@ pub fn send_continuous_packets(
     Ok(())
 }
 
-pub fn receive_analytics(
-    socket: &UdpSocket,
-) -> Result<()> {
-    let mut buf = [0u8; 8192];  // Larger buffer for analytics
-
-    match socket.recv_from(&mut buf) {
-        Ok((amt, _src)) => {
-            // Try to deserialize as AnalyticsSnapshot
-            if let Ok(snapshot) = postcard::from_bytes::<AnalyticsSnapshot>(&buf[..amt]) {
-                display_analytics(&snapshot);
-            }
-        }
-        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // No data available
-        }
-        Err(e) => {
-            eprintln!("Error receiving analytics: {}", e);
-        }
-    }
-
-    Ok(())
-}
-
 fn display_analytics(snapshot: &AnalyticsSnapshot) {
     use crossterm::{ExecutableCommand, cursor, terminal};
-    use std::io::stdout;
+    use std::io::{stdout, Write};
 
     let mut out = stdout();
     out.execute(cursor::SavePosition).ok();
-    out.execute(cursor::MoveTo(0, 3)).ok();
+    out.execute(cursor::MoveTo(0, 20)).ok();
     out.execute(terminal::Clear(terminal::ClearType::FromCursorDown)).ok();
 
-    println!("\n=== Analytics Snapshot ===");
-    println!("Server uptime: {:.2}s", snapshot.server_uptime_us as f64 / 1_000_000.0);
-    println!("Total packets: {}", snapshot.global_stats.total_packets);
-    println!("Total bytes: {}", snapshot.global_stats.total_bytes);
-    println!("Unique clients: {}", snapshot.global_stats.unique_clients);
+    // Build the entire output string first (use \r\n for raw mode)
+    let mut output = String::new();
+    output.push_str("=== Analytics Snapshot ===\r\n");
+    output.push_str(&format!("Server uptime: {:.2}s\r\n", snapshot.server_uptime_us as f64 / 1_000_000.0));
+    output.push_str(&format!("Total packets: {}\r\n", snapshot.global_stats.total_packets));
+    output.push_str(&format!("Total bytes: {}\r\n", snapshot.global_stats.total_bytes));
+    output.push_str(&format!("Unique clients: {}\r\n", snapshot.global_stats.unique_clients));
 
-    println!("\nPer-class breakdown:");
+    output.push_str("\r\nPer-class breakdown:\r\n");
     let classes = ["Api", "HeavyCompute", "Background", "HealthCheck"];
     for (i, name) in classes.iter().enumerate() {
         let pkts = snapshot.global_stats.packets_by_class[i];
         let bytes = snapshot.global_stats.bytes_by_class[i];
         if pkts > 0 {
-            println!("  {}: {} packets, {} bytes", name, pkts, bytes);
+            output.push_str(&format!("  {}: {} packets, {} bytes\r\n", name, pkts, bytes));
         }
     }
 
     if let Some(client) = snapshot.per_client_stats.first() {
-        println!("\nLatency: min={}µs max={}µs avg={:.0}µs",
-            client.latency.min_rtt_us,
-            client.latency.max_rtt_us,
-            client.latency.mean_rtt_us
-        );
+        // Only show latency if we have actual samples (min_rtt != u64::MAX sentinel)
+        if client.latency.samples > 0 && client.latency.min_rtt_us != u64::MAX {
+            output.push_str(&format!("\r\nLatency: min={}µs max={}µs avg={:.0}µs\r\n",
+                client.latency.min_rtt_us,
+                client.latency.max_rtt_us,
+                client.latency.mean_rtt_us
+            ));
+        } else {
+            output.push_str("\r\nLatency: (no RTT data collected by server)\r\n");
+        }
 
-        println!("Loss: {} missing, {} out-of-order, {} duplicates",
+        output.push_str(&format!("Loss: {} missing, {} out-of-order, {} duplicates\r\n",
             client.loss.missing_sequences,
             client.loss.out_of_order,
             client.loss.duplicates
-        );
+        ));
     }
 
-    println!("========================\n");
+    output.push_str("========================\r\n");
+
+    // Print all at once and flush
+    print!("{}", output);
+    out.flush().ok();
     out.execute(cursor::RestorePosition).ok();
 }

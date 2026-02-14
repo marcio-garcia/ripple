@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use common::Packet;
 
 /// Main analytics engine tracking all clients and stats
@@ -78,11 +78,22 @@ impl AnalyticsManager {
         client.rate_calculators[class_idx]
             .record_packet(now, packet.declared_bytes);
 
-        // 7. Create and return ACK payload
-        let server_timestamp_us = now
-            .duration_since(self.start_time)
+        // 7. Calculate one-way latency (client timestamp → server receive time)
+        // Use absolute wall-clock time (UNIX epoch) for accurate latency
+        let server_timestamp_us = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("System time before UNIX epoch")
             .as_micros() as u64;
 
+        let client_timestamp_us = packet.timestamp_us;
+
+        // One-way latency (client and server use same time base: UNIX epoch)
+        if server_timestamp_us >= client_timestamp_us {
+            let latency_us = server_timestamp_us - client_timestamp_us;
+            client.latency_stats.add_rtt_sample(latency_us);
+        }
+
+        // 8. Create and return ACK payload
         common::ack::AckPayload {
             original_seq: packet.seq,
             server_timestamp_us,

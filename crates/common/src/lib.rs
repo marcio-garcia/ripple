@@ -1,4 +1,4 @@
-use std::{fmt::Display, time::Instant};
+use std::{fmt::Display, time::{Instant, SystemTime}};
 
 pub mod ack;
 pub mod analytics;
@@ -92,10 +92,14 @@ pub fn pack_data_packet(
     seq: u32,
     data_type: u8,
     class: TrafficClass,
-    client_start: Instant,
+    _client_start: Instant,  // Kept for API compatibility, but now using absolute time
     declared_bytes: u32,
 ) -> [u8; 24] {
-    let ts_us: u64 = client_start.elapsed().as_micros() as u64;
+    // Use absolute wall-clock time (UNIX epoch) for latency calculation
+    let ts_us: u64 = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("System time before UNIX epoch")
+        .as_micros() as u64;
     pack_header(ts_us, declared_bytes, data_type, class as u8, seq)
 }
 
