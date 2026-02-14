@@ -8,7 +8,7 @@ pub struct AckPayload {
     /// When server received the packet (microseconds since server start)
     pub server_timestamp_us: u64,
     /// How long server took to process (typically microseconds)
-    pub server_processing_us: u64,
+    pub server_processing_us: u32,
 }
 
 pub fn parse_ack_packet(buf: &[u8]) -> Option<AckPayload> {
@@ -19,7 +19,7 @@ pub fn parse_ack_packet(buf: &[u8]) -> Option<AckPayload> {
 
         let original_seq = u32::from_le_bytes(buf[24..28].try_into().ok()?);
         let server_timestamp_us = u64::from_le_bytes(buf[28..36].try_into().ok()?);
-        let server_processing_us = u64::from_le_bytes(buf[36..40].try_into().ok()?);
+        let server_processing_us = u32::from_le_bytes(buf[36..40].try_into().ok()?);
 
         return Some(AckPayload {
             original_seq,
@@ -30,7 +30,7 @@ pub fn parse_ack_packet(buf: &[u8]) -> Option<AckPayload> {
     None
 }
 
-pub fn pack_ack_packet(original_seq: u32, server_timestamp_us: u64, server_processing_us: u64) -> [u8; 40] {
+pub fn pack_ack_packet(original_seq: u32, server_timestamp_us: u64, server_processing_us: u32) -> [u8; 40] {
     let mut buf = [0u8; 40];
     let header = pack_header(
         server_timestamp_us,

@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::Result,
+    io::{Result, stdout},
     net::UdpSocket,
     time::{Duration, Instant}
 };
 use common::{TYPE_DATA, TrafficClass, pack_data_packet};
+use crossterm::{ExecutableCommand, cursor, terminal};
 
 #[derive(Clone, Copy)]
 pub struct ScheduledSend {
@@ -109,15 +110,20 @@ pub fn receive_acks(
                         state.max_rtt = state.max_rtt.max(rtt);
                         state.sum_rtt += rtt;
 
-                        println!(
-                            "ACK seq={} RTT={}µs (min={} max={} avg={})",
+                        // Display RTT on fixed line
+                        let mut out = stdout();
+                        out.execute(cursor::SavePosition)?;
+                        out.execute(cursor::MoveTo(0, 1))?;  // Move to stats line
+                        out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
+                        print!(
+                            "Stats: ACK seq={:5} | RTT={:4}µs | min={:4} max={:4} avg={:4}",
                             ack.original_seq,
                             rtt.as_micros(),
                             state.min_rtt.as_micros(),
                             state.max_rtt.as_micros(),
                             (state.sum_rtt.as_micros() / state.total_acks as u128)
                         );
-                    }
+                        out.execute(cursor::RestorePosition)?;                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,

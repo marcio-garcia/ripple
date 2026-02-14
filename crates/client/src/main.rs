@@ -33,6 +33,9 @@ fn main() -> Result<()> {
 
     println!("Network Traffic simulator");
     stdout.execute(MoveToNextLine(1))?;
+    println!("Stats: [waiting for ACKs...]");  // ← Add this line
+    stdout.execute(MoveToNextLine(1))?;
+    println!("Commands: Space=send | B=burst | 1-9=count | Q=quit");
 
     let socket = open_socket().expect("Couldn't open socket");
     socket.set_nonblocking(true).expect("error on non blocking");
