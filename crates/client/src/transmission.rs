@@ -14,6 +14,16 @@ pub struct ScheduledSend {
     pub declared_bytes: u32,
 }
 
+pub enum SendMode {
+    Idle,
+    Burst,
+    Continuous {
+        class: TrafficClass,
+        packets_per_second: u32,
+        last_send: Instant,
+        interval: Duration,
+    },
+}
 
 pub struct ClientState {
     pub burst_count: u32,
@@ -25,6 +35,7 @@ pub struct ClientState {
     pub min_rtt: Duration,
     pub max_rtt: Duration,
     pub sum_rtt: Duration,
+    pub send_mode: SendMode,
 }
 
 impl ClientState {
@@ -39,6 +50,7 @@ impl ClientState {
             min_rtt: Duration::MAX,
             max_rtt: Duration::ZERO,
             sum_rtt: Duration::ZERO,
+            send_mode: SendMode::Idle,
         }
     }
 }
@@ -131,6 +143,36 @@ pub fn receive_acks(
                 eprintln!("Error receiving ACK: {}", e);
                 break;
             }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn send_continuous_packets(
+    state: &mut ClientState,
+    socket: &UdpSocket,
+    server_addr: &str,
+) -> Result<()> {
+    if let SendMode::Continuous { class, packets_per_second, last_send, interval } = &mut state.send_mode {
+        let now = Instant::now();
+
+        if now.duration_since(*last_send) >= *interval {
+            // Send packet
+            let pkt = pack_data_packet(
+                state.seq,
+                TYPE_DATA,
+                *class,
+                state.client_start,
+                1200  // Default bytes
+            );
+            let send_time = Instant::now();
+            socket.send_to(&pkt, server_addr)?;
+
+            state.pending_acks.insert(state.seq, send_time);
+            state.seq = state.seq.wrapping_add(1);
+
+            *last_send = now;
         }
     }
 

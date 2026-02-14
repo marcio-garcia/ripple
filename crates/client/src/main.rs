@@ -10,7 +10,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use crate::input::{execute_command, handle_input};
-use crate::transmission::{ClientState, receive_acks, send_scheduled_packets};
+use crate::transmission::{ClientState, receive_acks, send_continuous_packets, send_scheduled_packets};
 
 mod input;
 mod transmission;
@@ -69,6 +69,9 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
 
         // Send scheduled packets
         send_scheduled_packets(&mut state, &socket, server_addr, Instant::now())?;
+
+        // Send continuous packets (if in continuous mode)
+        send_continuous_packets(&mut state, &socket, server_addr)?;  // ← Add this
 
         // Receive ACKs
         receive_acks(&mut state, &socket)?;
