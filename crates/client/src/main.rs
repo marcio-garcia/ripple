@@ -10,7 +10,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use crate::input::{execute_command, handle_input};
-use crate::transmission::{ClientState, receive_acks, send_continuous_packets, send_scheduled_packets};
+use crate::transmission::{ClientState, receive_acks, receive_analytics, send_continuous_packets, send_scheduled_packets};
 
 mod input;
 mod transmission;
@@ -58,7 +58,12 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         _ => {
                             if let Some(command) = handle_input(key.code) {
-                                execute_command(command, &mut state);
+                                execute_command(
+                                    command,
+                                    &mut state,
+                                    &socket,
+                                    server_addr
+                                )?;
                             }
                         }
                     }
@@ -75,6 +80,9 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
 
         // Receive ACKs
         receive_acks(&mut state, &socket)?;
+
+        // Receive analytics (if requested)
+        receive_analytics(&socket)?;  // ← Add this
 
         std::thread::sleep(Duration::from_millis(1));
     }

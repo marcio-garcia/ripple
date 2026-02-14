@@ -19,7 +19,8 @@ pub struct AnalyticsManager {
 
     /// Configuration
     rate_window_secs: u32,  // 5 seconds
-    max_clients: usize,     // Prevent unbounded growth (e.g., 1000)
+    #[allow(dead_code)]
+    max_clients: usize,     // Prevent unbounded growth (e.g., 1000) - reserved for future use
 }
 
 impl AnalyticsManager {
@@ -187,7 +188,8 @@ impl AnalyticsManager {
 
 /// State for a single client
 pub struct ClientState {
-    /// Client's address
+    /// Client's address (reserved for future debugging)
+    #[allow(dead_code)]
     addr: SocketAddr,
     /// When we first saw this client
     first_seen: Instant,

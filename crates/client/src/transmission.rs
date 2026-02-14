@@ -4,7 +4,12 @@ use std::{
     net::UdpSocket,
     time::{Duration, Instant}
 };
-use common::{TYPE_DATA, TrafficClass, pack_data_packet};
+use common::{
+    TYPE_DATA,
+    TrafficClass,
+    analytics::AnalyticsSnapshot,
+    pack_data_packet
+};
 use crossterm::{ExecutableCommand, cursor, terminal};
 
 #[derive(Clone, Copy)]
@@ -16,10 +21,10 @@ pub struct ScheduledSend {
 
 pub enum SendMode {
     Idle,
-    Burst,
     Continuous {
         class: TrafficClass,
-        packets_per_second: u32,
+        #[allow(dead_code)]
+        packets_per_second: u32,  // Reserved for displaying current rate
         last_send: Instant,
         interval: Duration,
     },
@@ -154,7 +159,7 @@ pub fn send_continuous_packets(
     socket: &UdpSocket,
     server_addr: &str,
 ) -> Result<()> {
-    if let SendMode::Continuous { class, packets_per_second, last_send, interval } = &mut state.send_mode {
+    if let SendMode::Continuous { class, packets_per_second: _, last_send, interval } = &mut state.send_mode {
         let now = Instant::now();
 
         if now.duration_since(*last_send) >= *interval {
@@ -177,4 +182,70 @@ pub fn send_continuous_packets(
     }
 
     Ok(())
+}
+
+pub fn receive_analytics(
+    socket: &UdpSocket,
+) -> Result<()> {
+    let mut buf = [0u8; 8192];  // Larger buffer for analytics
+
+    match socket.recv_from(&mut buf) {
+        Ok((amt, _src)) => {
+            // Try to deserialize as AnalyticsSnapshot
+            if let Ok(snapshot) = postcard::from_bytes::<AnalyticsSnapshot>(&buf[..amt]) {
+                display_analytics(&snapshot);
+            }
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // No data available
+        }
+        Err(e) => {
+            eprintln!("Error receiving analytics: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+fn display_analytics(snapshot: &AnalyticsSnapshot) {
+    use crossterm::{ExecutableCommand, cursor, terminal};
+    use std::io::stdout;
+
+    let mut out = stdout();
+    out.execute(cursor::SavePosition).ok();
+    out.execute(cursor::MoveTo(0, 3)).ok();
+    out.execute(terminal::Clear(terminal::ClearType::FromCursorDown)).ok();
+
+    println!("\n=== Analytics Snapshot ===");
+    println!("Server uptime: {:.2}s", snapshot.server_uptime_us as f64 / 1_000_000.0);
+    println!("Total packets: {}", snapshot.global_stats.total_packets);
+    println!("Total bytes: {}", snapshot.global_stats.total_bytes);
+    println!("Unique clients: {}", snapshot.global_stats.unique_clients);
+
+    println!("\nPer-class breakdown:");
+    let classes = ["Api", "HeavyCompute", "Background", "HealthCheck"];
+    for (i, name) in classes.iter().enumerate() {
+        let pkts = snapshot.global_stats.packets_by_class[i];
+        let bytes = snapshot.global_stats.bytes_by_class[i];
+        if pkts > 0 {
+            println!("  {}: {} packets, {} bytes", name, pkts, bytes);
+        }
+    }
+
+    if let Some(client) = snapshot.per_client_stats.first() {
+        println!("\nLatency: min={}µs max={}µs avg={:.0}µs",
+            client.latency.min_rtt_us,
+            client.latency.max_rtt_us,
+            client.latency.mean_rtt_us
+        );
+
+        println!("Loss: {} missing, {} out-of-order, {} duplicates",
+            client.loss.missing_sequences,
+            client.loss.out_of_order,
+            client.loss.duplicates
+        );
+    }
+
+    println!("========================\n");
+    out.execute(cursor::RestorePosition).ok();
 }

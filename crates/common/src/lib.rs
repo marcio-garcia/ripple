@@ -6,9 +6,10 @@ pub mod analytics;
 pub const MAGIC: u32 = 0x4A4E4554; // 'JNET'
 pub const TYPE_DATA: u8 = 1;
 pub const TYPE_ACK: u8 = 2; // server acknowledgments
+pub const TYPE_ANALYTICS: u8 = 3; // analytics snapshots
+pub const TYPE_REQUEST_ANALYTICS: u8 = 4; // client requests analytics
 const VERSION: u8 = 1;
-const TYPE_ANALYTICS: u8 = 3; // analytics snapshots
-const TYPE_REQUEST_ANALYTICS: u8 = 4; // client requests analytics
+
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]

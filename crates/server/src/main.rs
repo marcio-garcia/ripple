@@ -1,5 +1,5 @@
 use std::{io::Result, net::UdpSocket, time::Instant};
-use common::{MAGIC, parse_packet};
+use common::{MAGIC, TYPE_DATA, TYPE_REQUEST_ANALYTICS, parse_packet};
 use crate::analytics::AnalyticsManager;
 
 pub mod analytics;
@@ -23,21 +23,34 @@ fn main() -> Result<()>{
                 continue;
             }
 
-            // Process packet through analytics
-            let ack_payload = analytics.on_packet_received(src, &packet, Instant::now());
+            match packet.msg_type {
+                TYPE_DATA => {
+                    // Existing analytics processing
+                    let ack_payload = analytics.on_packet_received(src, &packet, Instant::now());
+                    let ack_packet = common::ack::pack_ack_packet(
+                        ack_payload.original_seq,
+                        ack_payload.server_timestamp_us,
+                        ack_payload.server_processing_us,
+                    );
+                    socket.send_to(&ack_packet, src)?;
+                    println!("seq={} class={} → ACK sent", packet.seq, packet.class);
+                }
 
-            // Pack and send ACK
-            let ack_packet = common::ack::pack_ack_packet(
-                ack_payload.original_seq,
-                ack_payload.server_timestamp_us,
-                ack_payload.server_processing_us,
-            );
-            socket.send_to(&ack_packet, src)?;
+                TYPE_REQUEST_ANALYTICS => {
+                    // Export and send analytics
+                    let snapshot = analytics.export_snapshot();
+                    let analytics_bytes = postcard::to_stdvec(&snapshot)
+                        .expect("Failed to serialize analytics");
 
-            println!(
-                "seq={} class={} → ACK sent",
-                packet.seq, packet.class
-            );
+                    // Send analytics packet (header + payload)
+                    socket.send_to(&analytics_bytes, src)?;
+                    println!("Analytics snapshot sent to {} ({} bytes)", src, analytics_bytes.len());
+                }
+
+                _ => {
+                    println!("Unknown packet type: {}", packet.msg_type);
+                }
+            }
         }
 
         packet_count += 1;
