@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
-use common::Packet;
+use common::{AckPacket, DataPacket};
 
 /// Main analytics engine tracking all clients and stats
 pub struct AnalyticsManager {
@@ -40,9 +40,9 @@ impl AnalyticsManager {
     pub fn on_packet_received(
         &mut self,
         src: SocketAddr,
-        packet: &Packet,
+        packet: &DataPacket,
         now: Instant
-    ) -> common::ack::AckPayload {
+    ) -> AckPacket {
         // Get or create client state
         let client = self.clients
             .entry(src)
@@ -64,7 +64,7 @@ impl AnalyticsManager {
 
         // Process sequence - detect packet loss
         let loss_event = client.seq_trackers[class_idx]
-            .process_sequence(packet.seq, now);
+            .process_sequence(packet.class_seq, now);
 
         // Log loss events
         match loss_event {
@@ -94,8 +94,8 @@ impl AnalyticsManager {
         }
 
         // 8. Create and return ACK payload
-        common::ack::AckPayload {
-            original_seq: packet.seq,
+        AckPacket {
+            original_seq: packet.global_seq,
             server_timestamp_us,
             server_processing_us: 0,  // Could measure actual processing time if needed
         }

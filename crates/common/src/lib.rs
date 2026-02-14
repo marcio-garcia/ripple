@@ -1,18 +1,11 @@
-use std::{fmt::Display, time::{Instant, SystemTime}};
+use std::{fmt::Display, time::SystemTime};
 
-pub mod ack;
+use serde::{Deserialize, Serialize};
+
 pub mod analytics;
 
-pub const MAGIC: u32 = 0x4A4E4554; // 'JNET'
-pub const TYPE_DATA: u8 = 1;
-pub const TYPE_ACK: u8 = 2; // server acknowledgments
-pub const TYPE_ANALYTICS: u8 = 3; // analytics snapshots
-pub const TYPE_REQUEST_ANALYTICS: u8 = 4; // client requests analytics
-const VERSION: u8 = 1;
-
-
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum TrafficClass {
     Api = 0,
     HeavyCompute = 1,
@@ -29,81 +22,80 @@ impl Display for TrafficClass {
             Background => write!(f, "background"),
             HealthCheck => write!(f, "health check"),
         }
-
     }
 }
 
-#[derive(Debug)]
-pub struct Packet {
-    pub magic: u32,
-    pub declared_bytes: u32,
-    pub version: u8,
-    pub msg_type: u8,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DataPacket {
+    pub global_seq: u32,
+    pub class_seq: u32,
     pub class: TrafficClass,
-    pub flags: u8,
-    pub seq: u32,
     pub timestamp_us: u64,
+    pub declared_bytes: u32,
 }
 
-fn pack_header(
-    timestamp: u64, // as micros
-    declared_bytes: u32,
-    data_type: u8,
-    class: u8,
-    seq: u32,
-) -> [u8; 24] {
-    let mut buf = [0u8; 24];
-    buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    buf[4..8].copy_from_slice(&declared_bytes.to_le_bytes());
-    buf[8] = VERSION;
-    buf[9] = data_type;
-    buf[10] = class;
-    buf[11] = 0;
-    buf[12..16].copy_from_slice(&seq.to_le_bytes());
-    buf[16..24].copy_from_slice(&timestamp.to_le_bytes());
-    buf
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AckPacket {
+    pub original_seq: u32,
+    pub server_timestamp_us: u64,
+    pub server_processing_us: u32,
 }
 
-pub fn parse_header(buf: &[u8]) -> Option<Packet> {
-    if buf.len() < 24 { return None; }
-
-    let class_u8 = buf[10];
-    let class = match class_u8 {
-        0 => TrafficClass::Api,
-        1 => TrafficClass::HeavyCompute,
-        2 => TrafficClass::Background,
-        3 => TrafficClass::HealthCheck,
-        _ => return None,
-    };
-
-    Some(Packet {
-        magic: u32::from_le_bytes(buf[0..4].try_into().ok()?),
-        declared_bytes: u32::from_le_bytes(buf[4..8].try_into().ok()?),
-        version: buf[8],
-        msg_type: buf[9],
-        class,
-        flags: buf[11],
-        seq: u32::from_le_bytes(buf[12..16].try_into().ok()?),
-        timestamp_us: u64::from_le_bytes(buf[16..24].try_into().ok()?),
-    })
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WireMessage {
+    Data(DataPacket),
+    Ack(AckPacket),
+    RequestAnalytics,
+    Analytics(analytics::AnalyticsSnapshot),
 }
 
-pub fn pack_data_packet(
-    seq: u32,
-    data_type: u8,
-    class: TrafficClass,
-    _client_start: Instant,  // Kept for API compatibility, but now using absolute time
-    declared_bytes: u32,
-) -> [u8; 24] {
-    // Use absolute wall-clock time (UNIX epoch) for latency calculation
-    let ts_us: u64 = SystemTime::now()
+pub fn now_timestamp_us() -> u64 {
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("System time before UNIX epoch")
-        .as_micros() as u64;
-    pack_header(ts_us, declared_bytes, data_type, class as u8, seq)
+        .as_micros() as u64
 }
 
-pub fn parse_packet(buf: &[u8]) -> Option<Packet> {
-    if buf.len() < 24 { return None; }
-    parse_header(buf)
+pub fn make_data_packet(
+    global_seq: u32,
+    class_seq: u32,
+    class: TrafficClass,
+    declared_bytes: u32,
+) -> DataPacket {
+    DataPacket {
+        global_seq,
+        class_seq,
+        class,
+        timestamp_us: now_timestamp_us(),
+        declared_bytes,
+    }
+}
+
+pub fn encode_message(message: &WireMessage) -> postcard::Result<Vec<u8>> {
+    postcard::to_stdvec(message)
+}
+
+pub fn decode_message(bytes: &[u8]) -> postcard::Result<WireMessage> {
+    postcard::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_data_message() {
+        let msg = WireMessage::Data(make_data_packet(10, 5, TrafficClass::Background, 1200));
+        let bytes = encode_message(&msg).expect("should encode");
+        let decoded = decode_message(&bytes).expect("should decode");
+        match decoded {
+            WireMessage::Data(packet) => {
+                assert_eq!(packet.global_seq, 10);
+                assert_eq!(packet.class_seq, 5);
+                assert_eq!(packet.class, TrafficClass::Background);
+                assert_eq!(packet.declared_bytes, 1200);
+            }
+            _ => panic!("expected data message"),
+        }
+    }
 }

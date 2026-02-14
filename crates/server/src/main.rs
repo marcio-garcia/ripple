@@ -1,8 +1,13 @@
 use std::{env, io::Result, net::UdpSocket, time::Instant};
-use common::{MAGIC, TYPE_DATA, TYPE_REQUEST_ANALYTICS, parse_packet};
+use std::io::Error;
+use common::WireMessage;
 use crate::analytics::AnalyticsManager;
 
 pub mod analytics;
+
+fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
+    common::encode_message(message).map_err(Error::other)
+}
 
 fn main() -> Result<()>{
     let mut server_addr = String::from("127.0.0.1");
@@ -33,40 +38,30 @@ fn main() -> Result<()>{
 
         println!("Received {} bytes from {}", amt, src);
 
-        if let Some(packet) = parse_packet(&buf[..amt]) {
-            if packet.magic != MAGIC {
-                println!("Invalid packet: {:08x}", packet.magic);
-                continue;
-            }
-
-            match packet.msg_type {
-                TYPE_DATA => {
-                    // Existing analytics processing
-                    let ack_payload = analytics.on_packet_received(src, &packet, Instant::now());
-                    let ack_packet = common::ack::pack_ack_packet(
-                        ack_payload.original_seq,
-                        ack_payload.server_timestamp_us,
-                        ack_payload.server_processing_us,
+        if let Ok(message) = common::decode_message(&buf[..amt]) {
+            match message {
+                WireMessage::Data(packet) => {
+                    let ack = analytics.on_packet_received(src, &packet, Instant::now());
+                    let ack_bytes = encode_wire_message(&WireMessage::Ack(ack))?;
+                    socket.send_to(&ack_bytes, src)?;
+                    println!(
+                        "seq={} class={} class_seq={} → ACK sent",
+                        packet.global_seq, packet.class, packet.class_seq
                     );
-                    socket.send_to(&ack_packet, src)?;
-                    println!("seq={} class={} → ACK sent", packet.seq, packet.class);
                 }
-
-                TYPE_REQUEST_ANALYTICS => {
-                    // Export and send analytics
+                WireMessage::RequestAnalytics => {
                     let snapshot = analytics.export_snapshot();
-                    let analytics_bytes = postcard::to_stdvec(&snapshot)
-                        .expect("Failed to serialize analytics");
-
-                    // Send analytics packet (header + payload)
+                    let analytics_bytes =
+                        encode_wire_message(&WireMessage::Analytics(snapshot))?;
                     socket.send_to(&analytics_bytes, src)?;
                     println!("Analytics snapshot sent to {} ({} bytes)", src, analytics_bytes.len());
                 }
-
-                _ => {
-                    println!("Unknown packet type: {}", packet.msg_type);
+                WireMessage::Ack(_) | WireMessage::Analytics(_) => {
+                    println!("Ignoring unexpected server-side message from {}", src);
                 }
             }
+        } else {
+            println!("Failed to decode packet from {}", src);
         }
 
         packet_count += 1;

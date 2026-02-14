@@ -27,7 +27,7 @@ impl Drop for TerminalGuard {
 
 fn main() -> Result<()> {
     let mut server_addr = String::from("127.0.0.1");
-    let mut port = String::from("");
+    let mut port = String::from("8080");
     let args: Vec<String> = env::args().collect();
     println!("Program path: {}", args[0]);
 

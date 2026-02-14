@@ -1,5 +1,6 @@
 use std::{io::Result, net::UdpSocket, time::{Duration, Instant}};
-use common::{TYPE_REQUEST_ANALYTICS, TrafficClass};
+use std::io::Error;
+use common::{TrafficClass, WireMessage};
 use crossterm::event::KeyCode;
 use crate::transmission::{ClientState, SendMode, schedule_burst};
 
@@ -95,13 +96,7 @@ pub fn execute_command(
             Ok(())
         },
         InputCommand::RequestAnalytics => {
-            let pkt = common::pack_data_packet(
-                0,
-                TYPE_REQUEST_ANALYTICS,
-                common::TrafficClass::HealthCheck,
-                state.client_start,
-                24  // Header only
-            );
+            let pkt = common::encode_message(&WireMessage::RequestAnalytics).map_err(Error::other)?;
             socket.send_to(&pkt, server_addr)?;
             print!("Requesting analytics...");
             Ok(())

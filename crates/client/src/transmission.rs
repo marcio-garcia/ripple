@@ -1,14 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::{Result, stdout},
+    io::{Error, Result, stdout},
     net::UdpSocket,
     time::{Duration, Instant}
 };
 use common::{
-    TYPE_DATA,
-    TrafficClass,
-    analytics::AnalyticsSnapshot,
-    pack_data_packet
+    TrafficClass, WireMessage, analytics::AnalyticsSnapshot, make_data_packet
 };
 use crossterm::{ExecutableCommand, cursor, terminal};
 
@@ -32,8 +29,8 @@ pub enum SendMode {
 
 pub struct ClientState {
     pub burst_count: u32,
-    pub client_start: Instant,
-    pub seq: u32,
+    pub next_global_seq: u32,
+    pub next_class_seq: HashMap<TrafficClass, u32>,
     pub queue: VecDeque<ScheduledSend>,
     pub pending_acks: HashMap<u32, Instant>,
     pub total_acks: u64,
@@ -45,10 +42,15 @@ pub struct ClientState {
 
 impl ClientState {
     pub fn new() -> Self {
+        let mut init_class_seq = HashMap::new();
+        init_class_seq.insert(TrafficClass::Api, 0);
+        init_class_seq.insert(TrafficClass::Background, 0);
+        init_class_seq.insert(TrafficClass::HeavyCompute, 0);
+        init_class_seq.insert(TrafficClass::HealthCheck, 0);
         Self {
             burst_count: 200,
-            client_start: Instant::now(),
-            seq: 0,
+            next_global_seq: 0,
+            next_class_seq: init_class_seq,
             queue: VecDeque::new(),
             pending_acks: HashMap::new(),
             total_acks: 0,
@@ -58,6 +60,10 @@ impl ClientState {
             send_mode: SendMode::Idle,
         }
     }
+}
+
+fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
+    common::encode_message(message).map_err(Error::other)
 }
 
 pub fn send_scheduled_packets(
@@ -74,18 +80,22 @@ pub fn send_scheduled_packets(
 
         state.queue.pop_front();
 
-        let pkt = pack_data_packet(
-            state.seq,
-            TYPE_DATA,
-            front.class,
-            state.client_start,
-            front.declared_bytes
-        );
-        let send_time = Instant::now();
-        socket.send_to(&pkt, server_addr)?;
+        let class_seq = state.next_class_seq.get(&front.class).unwrap_or(&0);
 
-        state.pending_acks.insert(state.seq, send_time);
-        state.seq = state.seq.wrapping_add(1);
+        let pkt = make_data_packet(
+            state.next_global_seq,
+            *class_seq,
+            front.class,
+            front.declared_bytes,
+        );
+        let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
+        let send_time = Instant::now();
+        socket.send_to(&bytes, server_addr)?;
+
+        state.pending_acks.insert(state.next_global_seq, send_time);
+        state.next_global_seq = state.next_global_seq.wrapping_add(1);
+        let next_class_seq = class_seq.wrapping_add(1);
+        state.next_class_seq.insert(front.class, next_class_seq);
     }
 
     Ok(())
@@ -118,41 +128,36 @@ pub fn receive_acks(
     loop {
         match socket.recv_from(&mut buf) {
             Ok((amt, _src)) => {
-                // Check packet size to distinguish ACKs from analytics
-                if amt == 40 {
-                    // ACK packet
-                    if let Some(ack) = common::ack::parse_ack_packet(&buf[..amt]) {
-                        if let Some(send_time) = state.pending_acks.remove(&ack.original_seq) {
-                            let rtt = Instant::now() - send_time;
+                if let Ok(message) = common::decode_message(&buf[..amt]) {
+                    match message {
+                        WireMessage::Ack(ack) => {
+                            if let Some(send_time) = state.pending_acks.remove(&ack.original_seq) {
+                                let rtt = Instant::now() - send_time;
 
-                            state.total_acks += 1;
-                            state.min_rtt = state.min_rtt.min(rtt);
-                            state.max_rtt = state.max_rtt.max(rtt);
-                            state.sum_rtt += rtt;
+                                state.total_acks += 1;
+                                state.min_rtt = state.min_rtt.min(rtt);
+                                state.max_rtt = state.max_rtt.max(rtt);
+                                state.sum_rtt += rtt;
 
-                            // Display RTT on fixed line
-                            let mut out = stdout();
-                            out.execute(cursor::SavePosition)?;
-                            out.execute(cursor::MoveTo(0, 2))?;  // Move to stats line
-                            out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
-                            print!(
-                                "Stats: ACK seq={:5} | RTT={:4}µs | min={:4} max={:4} avg={:4}",
-                                ack.original_seq,
-                                rtt.as_micros(),
-                                state.min_rtt.as_micros(),
-                                state.max_rtt.as_micros(),
-                                (state.sum_rtt.as_micros() / state.total_acks as u128)
-                            );
-                            out.execute(cursor::RestorePosition)?;
+                                let mut out = stdout();
+                                out.execute(cursor::SavePosition)?;
+                                out.execute(cursor::MoveTo(0, 2))?;
+                                out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
+                                print!(
+                                    "Stats: ACK seq={:5} | RTT={:4}µs | min={:4} max={:4} avg={:4}",
+                                    ack.original_seq,
+                                    rtt.as_micros(),
+                                    state.min_rtt.as_micros(),
+                                    state.max_rtt.as_micros(),
+                                    (state.sum_rtt.as_micros() / state.total_acks as u128)
+                                );
+                                out.execute(cursor::RestorePosition)?;
+                            }
                         }
-                    }
-                } else if amt > 100 {
-                    // Analytics packet (postcard serialized, typically hundreds/thousands of bytes)
-                    if let Ok(snapshot) = postcard::from_bytes::<common::analytics::AnalyticsSnapshot>(&buf[..amt]) {
-                        display_analytics(&snapshot);
+                        WireMessage::Analytics(snapshot) => display_analytics(&snapshot),
+                        WireMessage::Data(_) | WireMessage::RequestAnalytics => {}
                     }
                 }
-                // Ignore other packet sizes
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -173,20 +178,24 @@ pub fn send_continuous_packets(
     if let SendMode::Continuous { class, packets_per_second: _, last_send, interval } = &mut state.send_mode {
         let now = Instant::now();
 
+        let class_seq = state.next_class_seq.get(class).unwrap_or(&0);
+
         if now.duration_since(*last_send) >= *interval {
             // Send packet
-            let pkt = pack_data_packet(
-                state.seq,
-                TYPE_DATA,
+            let pkt = make_data_packet(
+                state.next_global_seq,
+                *class_seq,
                 *class,
-                state.client_start,
-                1200  // Default bytes
+                1200,
             );
+            let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
             let send_time = Instant::now();
-            socket.send_to(&pkt, server_addr)?;
+            socket.send_to(&bytes, server_addr)?;
 
-            state.pending_acks.insert(state.seq, send_time);
-            state.seq = state.seq.wrapping_add(1);
+            state.pending_acks.insert(state.next_global_seq, send_time);
+            state.next_global_seq = state.next_global_seq.wrapping_add(1);
+            let next_class_seq = class_seq.wrapping_add(1);
+            state.next_class_seq.insert(*class, next_class_seq);
 
             *last_send = now;
         }
