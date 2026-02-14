@@ -1,5 +1,5 @@
 use std::{env, io::Result, net::UdpSocket, time::Instant};
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use common::WireMessage;
 use crate::analytics::AnalyticsManager;
 
@@ -9,25 +9,50 @@ fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
     common::encode_message(message).map_err(Error::other)
 }
 
-fn main() -> Result<()>{
-    let mut server_addr = String::from("127.0.0.1");
-    let mut port = String::from("8080");
-    let args: Vec<String> = env::args().collect();
-    println!("Program path: {}", args[0]);
+fn parse_bind_addr_args() -> Result<String> {
+    let mut server = String::from("127.0.0.1");
+    let mut port: u16 = 8080;
+    let mut args = env::args().skip(1);
 
-    for (idx, arg) in args.iter().enumerate() {
-        if idx >= args.len() { continue; }
+    while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-s" => { server_addr = args[idx + 1].clone(); }
-            "-p" => { port = args[idx + 1].clone(); }
-            _ => {}
+            "-s" | "--server" => {
+                let value = args.next().ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "missing value for -s/--server")
+                })?;
+                server = value;
+            }
+            "-p" | "--port" => {
+                let value = args.next().ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "missing value for -p/--port")
+                })?;
+                port = value.parse::<u16>().map_err(|_| {
+                    Error::new(ErrorKind::InvalidInput, format!("invalid port: {value}"))
+                })?;
+            }
+            "-h" | "--help" => {
+                println!("Usage: server [-s|--server <host>] [-p|--port <port>]");
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("unknown argument: {arg}"),
+                ));
+            }
         }
     }
 
-    server_addr = format!("{}:{}", server_addr, port);
+    Ok(format!("{server}:{port}"))
+}
 
-    let socket = UdpSocket::bind(server_addr).expect("Couldn't bind to socket");
-    println!("Server listening on {}...", port);
+fn main() -> Result<()>{
+    let args: Vec<String> = env::args().collect();
+    println!("Program path: {}", args[0]);
+    let server_addr = parse_bind_addr_args()?;
+
+    let socket = UdpSocket::bind(&server_addr).expect("Couldn't bind to socket");
+    println!("Server listening on {}...", server_addr);
 
     let mut analytics = AnalyticsManager::new(5, 1000);  // 5-sec window, max 1000 clients
     let mut buf = [0u8; 1024];

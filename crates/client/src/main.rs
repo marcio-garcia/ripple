@@ -10,9 +10,11 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use crate::cli::parse_server_addr_args;
 use crate::input::{execute_command, handle_input};
 use crate::transmission::{ClientState, receive_acks, send_continuous_packets, send_scheduled_packets};
 
+mod cli;
 mod input;
 mod transmission;
 
@@ -26,21 +28,9 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> Result<()> {
-    let mut server_addr = String::from("127.0.0.1");
-    let mut port = String::from("8080");
     let args: Vec<String> = env::args().collect();
     println!("Program path: {}", args[0]);
-
-    for (idx, arg) in args.iter().enumerate() {
-        if idx >= args.len() { continue; }
-        match arg.as_str() {
-            "-s" => { server_addr = args[idx + 1].clone(); }
-            "-p" => { port = args[idx + 1].clone(); }
-            _ => {}
-        }
-    }
-
-    server_addr = format!("{}:{}", server_addr, port);
+    let server_addr = parse_server_addr_args()?;
 
     terminal::enable_raw_mode()?;
     let mut stdout = stdout();
