@@ -1,6 +1,6 @@
 use crate::transmission::{
     ClientState, ContinuousState, request_topology, run_topology_mixed_classes_test,
-    run_topology_removal_test, run_topology_smoke_test, schedule_burst,
+    run_topology_removal_test, run_topology_smoke_test, schedule_burst, update_source_domain,
 };
 use common::{EndpointDomain, TrafficClass, WireMessage};
 use crossterm::event::KeyCode;
@@ -139,7 +139,7 @@ pub fn execute_command(
             Ok(())
         }
         InputCommand::SetSourceDomain(domain) => {
-            state.src_domain = domain;
+            update_source_domain(state, domain, socket, server_addr)?;
             print!("Source domain now: {}", format_domain(state.src_domain));
             Ok(())
         }

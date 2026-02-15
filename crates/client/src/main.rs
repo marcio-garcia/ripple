@@ -1,7 +1,8 @@
 use crate::cli::parse_server_addr_args;
 use crate::input::{execute_command, handle_input};
 use crate::transmission::{
-    ClientState, receive_acks, send_continuous_packets, send_scheduled_packets,
+    ClientState, receive_acks, register_self, send_continuous_packets, send_scheduled_packets,
+    unregister_self,
 };
 use common::{EndpointDomain, load_or_create_id};
 use crossterm::{
@@ -68,12 +69,16 @@ fn main() -> Result<()> {
 fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
     let node_id = load_or_create_id(Path::new("client_id.txt"))?;
     let mut state = ClientState::new(node_id, DEFAULT_DESC);
+    register_self(&state, &socket, server_addr)?;
 
     loop {
         let timeout = compute_input_timeout(&state, Instant::now());
         if let Ok(Some(key)) = get_input(timeout) {
             match key {
-                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    let _ = unregister_self(&state, &socket, server_addr);
+                    break;
+                }
                 _ => {
                     if let Some(command) = handle_input(key) {
                         execute_command(command, &mut state, &socket, server_addr)?;

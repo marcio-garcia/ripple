@@ -1,7 +1,7 @@
 use common::{
     EndpointDomain, NodeDomain, NodeId, TrafficClass, WireMessage,
     analytics::{AnalyticsSnapshot, TopologySnapshot},
-    make_data_packet, make_register_node_packet, make_unregister_node_packet,
+    make_data_packet_with_endpoints, make_register_node_packet, make_unregister_node_packet,
 };
 use crossterm::{ExecutableCommand, cursor, terminal};
 use std::{
@@ -27,8 +27,11 @@ pub struct ContinuousState {
 pub struct ClientState {
     pub node_id: NodeId,
     pub desc: [u8; 16],
+    pub node_domain: NodeDomain,
     pub src_domain: EndpointDomain,
     pub dst_domain: EndpointDomain,
+    pub internal_peer_id: NodeId,
+    pub external_peer_id: NodeId,
     pub burst_count: u32,
     pub next_global_seq: u32,
     pub next_class_seq: HashMap<TrafficClass, u32>,
@@ -52,8 +55,11 @@ impl ClientState {
         Self {
             node_id,
             desc,
+            node_domain: NodeDomain::External,
             src_domain: EndpointDomain::External,
             dst_domain: EndpointDomain::Internal,
+            internal_peer_id: *b"peer-internal---",
+            external_peer_id: *b"peer-external---",
             burst_count: 200,
             next_global_seq: 0,
             next_class_seq: init_class_seq,
@@ -80,6 +86,13 @@ fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
     common::encode_message(message).map_err(Error::other)
 }
 
+fn destination_node_id(state: &ClientState, domain: EndpointDomain) -> NodeId {
+    match domain {
+        EndpointDomain::Internal => state.internal_peer_id,
+        EndpointDomain::External => state.external_peer_id,
+    }
+}
+
 fn send_data_packet(
     state: &mut ClientState,
     socket: &UdpSocket,
@@ -90,7 +103,9 @@ fn send_data_packet(
     dst_domain: EndpointDomain,
 ) -> Result<()> {
     let class_seq = state.next_class_seq.get(&class).unwrap_or(&0);
-    let pkt = make_data_packet(
+    let pkt = make_data_packet_with_endpoints(
+        state.node_id,
+        destination_node_id(state, dst_domain),
         state.node_id,
         state.next_global_seq,
         *class_seq,
@@ -114,9 +129,8 @@ fn send_register_node(
     state: &ClientState,
     socket: &UdpSocket,
     server_addr: &str,
-    domain: NodeDomain,
 ) -> Result<()> {
-    let pkt = make_register_node_packet(state.node_id, state.desc, domain);
+    let pkt = make_register_node_packet(state.node_id, state.desc, state.node_domain);
     let bytes = encode_wire_message(&WireMessage::RegisterNode(pkt))?;
     socket.send_to(&bytes, server_addr)?;
     Ok(())
@@ -135,6 +149,25 @@ pub fn request_topology(socket: &UdpSocket, server_addr: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn register_self(state: &ClientState, socket: &UdpSocket, server_addr: &str) -> Result<()> {
+    send_register_node(state, socket, server_addr)
+}
+
+pub fn unregister_self(state: &ClientState, socket: &UdpSocket, server_addr: &str) -> Result<()> {
+    send_unregister_node(state, socket, server_addr)
+}
+
+pub fn update_source_domain(
+    state: &mut ClientState,
+    domain: EndpointDomain,
+    socket: &UdpSocket,
+    server_addr: &str,
+) -> Result<()> {
+    state.src_domain = domain;
+    state.node_domain = NodeDomain::from(domain);
+    register_self(state, socket, server_addr)
+}
+
 pub fn run_topology_smoke_test(
     state: &mut ClientState,
     socket: &UdpSocket,
@@ -142,7 +175,8 @@ pub fn run_topology_smoke_test(
 ) -> Result<()> {
     state.queue.clear();
     state.continuous_state = None;
-    send_register_node(state, socket, server_addr, NodeDomain::Internal)?;
+    state.node_domain = NodeDomain::Internal;
+    send_register_node(state, socket, server_addr)?;
     send_data_packet(
         state,
         socket,
@@ -167,7 +201,8 @@ pub fn run_topology_removal_test(
 ) -> Result<()> {
     state.queue.clear();
     state.continuous_state = None;
-    send_register_node(state, socket, server_addr, NodeDomain::Internal)?;
+    state.node_domain = NodeDomain::Internal;
+    send_register_node(state, socket, server_addr)?;
     send_unregister_node(state, socket, server_addr)?;
     request_topology(socket, server_addr)?;
     state.pending_topology_expectation = Some(TopologyExpectation::Removal {
@@ -184,7 +219,8 @@ pub fn run_topology_mixed_classes_test(
 ) -> Result<()> {
     state.queue.clear();
     state.continuous_state = None;
-    send_register_node(state, socket, server_addr, NodeDomain::Internal)?;
+    state.node_domain = NodeDomain::Internal;
+    send_register_node(state, socket, server_addr)?;
     for class in [
         TrafficClass::Api,
         TrafficClass::HeavyCompute,
