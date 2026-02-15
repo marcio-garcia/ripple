@@ -1,6 +1,8 @@
 use crate::transmission::{
-    ClientState, ContinuousState, request_topology, run_topology_mixed_classes_test,
-    run_topology_removal_test, run_topology_smoke_test, schedule_burst, update_source_domain,
+    ClientState, ContinuousState, add_peer, cycle_active_peer, remove_active_peer,
+    request_topology, run_topology_mixed_classes_test, run_topology_removal_test,
+    run_topology_smoke_test, schedule_burst, select_or_add_peer_for_domain,
+    update_source_domain,
 };
 use common::{EndpointDomain, TrafficClass, WireMessage};
 use crossterm::event::KeyCode;
@@ -22,6 +24,9 @@ pub enum InputCommand {
     RunTopologySmokeTest,
     RunTopologyRemovalTest,
     RunTopologyMixedClassesTest,
+    AddPeer,
+    CyclePeer,
+    RemovePeer,
     SetSourceDomain(EndpointDomain),
     SetDestinationDomain(EndpointDomain),
 }
@@ -53,6 +58,9 @@ pub fn handle_input(key: KeyCode) -> Option<InputCommand> {
             't' => Some(InputCommand::RunTopologySmokeTest),
             'y' => Some(InputCommand::RunTopologyRemovalTest),
             'u' => Some(InputCommand::RunTopologyMixedClassesTest),
+            'n' => Some(InputCommand::AddPeer),
+            'c' => Some(InputCommand::CyclePeer),
+            'm' => Some(InputCommand::RemovePeer),
             'i' => Some(InputCommand::SetSourceDomain(EndpointDomain::Internal)),
             'e' => Some(InputCommand::SetSourceDomain(EndpointDomain::External)),
             'k' => Some(InputCommand::SetDestinationDomain(EndpointDomain::Internal)),
@@ -138,13 +146,28 @@ pub fn execute_command(
             run_topology_mixed_classes_test(state, socket, server_addr)?;
             Ok(())
         }
+        InputCommand::AddPeer => {
+            add_peer(state, state.dst_domain, socket, server_addr)?;
+            print!("Added peer in {} domain", format_domain(state.dst_domain));
+            Ok(())
+        }
+        InputCommand::CyclePeer => {
+            cycle_active_peer(state)?;
+            print!("Cycled active peer");
+            Ok(())
+        }
+        InputCommand::RemovePeer => {
+            remove_active_peer(state, socket, server_addr)?;
+            print!("Removed active peer");
+            Ok(())
+        }
         InputCommand::SetSourceDomain(domain) => {
             update_source_domain(state, domain, socket, server_addr)?;
             print!("Source domain now: {}", format_domain(state.src_domain));
             Ok(())
         }
         InputCommand::SetDestinationDomain(domain) => {
-            state.dst_domain = domain;
+            select_or_add_peer_for_domain(state, domain, socket, server_addr)?;
             print!(
                 "Destination domain now: {}",
                 format_domain(state.dst_domain)
