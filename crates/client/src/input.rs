@@ -82,7 +82,7 @@ pub fn execute_command(
         }
         InputCommand::StartContinuous { class, rate } => {
             let interval = Duration::from_secs(1) / rate;
-            // CHANGE: store the next scheduled send deadline instead of last-send time.
+            // store the next scheduled send deadline instead of last-send time.
             state.continuous_state = Some(ContinuousState {
                 class,
                 next_send_at: Instant::now() + interval,

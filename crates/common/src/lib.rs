@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod analytics;
 
+pub type ClientId = [u8; 16];
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum TrafficClass {
@@ -27,11 +29,13 @@ impl Display for TrafficClass {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DataPacket {
+    pub node_id: ClientId,
     pub global_seq: u32,
     pub class_seq: u32,
     pub class: TrafficClass,
     pub timestamp_us: u64,
     pub declared_bytes: u32,
+    pub desc: [u8; 16],
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -57,17 +61,21 @@ pub fn now_timestamp_us() -> u64 {
 }
 
 pub fn make_data_packet(
+    node_id: ClientId,
     global_seq: u32,
     class_seq: u32,
     class: TrafficClass,
     declared_bytes: u32,
+    desc: [u8; 16],
 ) -> DataPacket {
     DataPacket {
+        node_id,
         global_seq,
         class_seq,
         class,
         timestamp_us: now_timestamp_us(),
         declared_bytes,
+        desc,
     }
 }
 
@@ -85,15 +93,26 @@ mod tests {
 
     #[test]
     fn round_trip_data_message() {
-        let msg = WireMessage::Data(make_data_packet(10, 5, TrafficClass::Background, 1200));
+        let node_id: ClientId = *b"ABCDEFGHIJLMNOPQ";
+        let desc: [u8; 16] = *b"test-node-------";
+        let msg = WireMessage::Data(make_data_packet(
+            node_id,
+            10,
+            5,
+            TrafficClass::Background,
+            1200,
+            desc,
+        ));
         let bytes = encode_message(&msg).expect("should encode");
         let decoded = decode_message(&bytes).expect("should decode");
         match decoded {
             WireMessage::Data(packet) => {
+                assert_eq!(packet.node_id, node_id);
                 assert_eq!(packet.global_seq, 10);
                 assert_eq!(packet.class_seq, 5);
                 assert_eq!(packet.class, TrafficClass::Background);
                 assert_eq!(packet.declared_bytes, 1200);
+                assert_eq!(packet.desc, desc);
             }
             _ => panic!("expected data message"),
         }

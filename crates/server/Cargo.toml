@@ -7,4 +7,4 @@ edition = "2024"
 common = { path = "../common" }
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.0", features = ["use-std"] }
-serde_json = "1.0"  # For debug exports
+serde_json = "1.0"

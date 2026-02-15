@@ -36,6 +36,12 @@ pub struct GlobalStats {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClientStats {
+    /// id
+    pub node_id: [u8; 16],
+
+    /// description
+    pub desc: [u8; 16],
+
     /// Client address as string (e.g., "127.0.0.1:52341")
     pub addr: String,
 

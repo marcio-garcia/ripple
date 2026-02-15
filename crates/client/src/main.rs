@@ -13,11 +13,16 @@ use crossterm::{
 use std::env;
 use std::io::{Result, stdout};
 use std::net::UdpSocket;
+use std::path::Path;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 mod cli;
 mod input;
 mod transmission;
+
+const DEFAULT_DESC: [u8; 16] = *b"simd-client-----";
+const MAX_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
 struct TerminalGuard;
 
@@ -45,7 +50,7 @@ fn main() -> Result<()> {
     stdout.execute(MoveToNextLine(1))?;
     print!("Commands: Space=send | B=burst | 1-9=count | Q=quit");
     stdout.execute(MoveToNextLine(1))?;
-    print!("Stats: [waiting for ACKs...]"); // ← Add this line
+    print!("Stats: [waiting for ACKs...]");
 
     let socket = open_socket().expect("Couldn't open socket");
     socket.set_nonblocking(true).expect("error on non blocking");
@@ -55,10 +60,10 @@ fn main() -> Result<()> {
 }
 
 fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
-    let mut state = ClientState::new();
+    let node_id = load_or_create_client_id(Path::new("client_id.txt"))?;
+    let mut state = ClientState::new(node_id, DEFAULT_DESC);
 
     loop {
-        // poll input only until the next send deadline instead of a fixed 50ms block.
         let timeout = compute_input_timeout(&state, Instant::now());
         if let Ok(Some(key)) = get_input(timeout) {
             match key {
@@ -73,15 +78,9 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
 
         stdout().execute(MoveToColumn(0))?;
 
-        // Send scheduled packets
         send_scheduled_packets(&mut state, &socket, server_addr, Instant::now())?;
-
-        // Send continuous packets (if in continuous mode)
         send_continuous_packets(&mut state, &socket, server_addr)?;
-
-        // Receive ACKs and analytics
         receive_acks(&mut state, &socket)?;
-        // no fixed sleep; dynamic input polling now paces the loop.
     }
 
     Ok(())
@@ -92,10 +91,6 @@ fn open_socket() -> Result<UdpSocket> {
     Ok(socket)
 }
 
-// cap idle polling so we stay responsive even when nothing is scheduled.
-const MAX_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
-
-// derive the next wake-up from burst and continuous schedules.
 fn compute_input_timeout(state: &ClientState, now: Instant) -> Duration {
     let next_burst_deadline = state.queue.front().map(|scheduled| scheduled.at);
     let next_continuous_deadline = state
@@ -125,4 +120,23 @@ fn get_input(timeout: Duration) -> Result<Option<KeyCode>> {
         }
     }
     Ok(None)
+}
+
+fn load_or_create_client_id(path: &Path) -> std::io::Result<common::ClientId> {
+    if path.exists() {
+        let existing = std::fs::read_to_string(path)?;
+        if let Ok(parsed) = Uuid::parse_str(existing.trim()) {
+            return Ok(*parsed.as_bytes());
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let id = Uuid::new_v4();
+    std::fs::write(path, format!("{id}\n"))?;
+    Ok(*id.as_bytes())
 }

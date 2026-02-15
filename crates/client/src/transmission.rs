@@ -1,4 +1,4 @@
-use common::{TrafficClass, WireMessage, analytics::AnalyticsSnapshot, make_data_packet};
+use common::{ClientId, TrafficClass, WireMessage, analytics::AnalyticsSnapshot, make_data_packet};
 use crossterm::{ExecutableCommand, cursor, terminal};
 use std::{
     collections::{HashMap, VecDeque},
@@ -16,11 +16,13 @@ pub struct ScheduledSend {
 
 pub struct ContinuousState {
     pub class: TrafficClass,
-    pub next_send_at: Instant, // track the absolute deadline for the next continuous packet.
+    pub next_send_at: Instant,
     pub interval: Duration,
 }
 
 pub struct ClientState {
+    pub node_id: ClientId,
+    pub desc: [u8; 16],
     pub burst_count: u32,
     pub next_global_seq: u32,
     pub next_class_seq: HashMap<TrafficClass, u32>,
@@ -34,13 +36,15 @@ pub struct ClientState {
 }
 
 impl ClientState {
-    pub fn new() -> Self {
+    pub fn new(node_id: ClientId, desc: [u8; 16]) -> Self {
         let mut init_class_seq = HashMap::new();
         init_class_seq.insert(TrafficClass::Api, 0);
         init_class_seq.insert(TrafficClass::Background, 0);
         init_class_seq.insert(TrafficClass::HeavyCompute, 0);
         init_class_seq.insert(TrafficClass::HealthCheck, 0);
         Self {
+            node_id,
+            desc,
             burst_count: 200,
             next_global_seq: 0,
             next_class_seq: init_class_seq,
@@ -76,10 +80,12 @@ pub fn send_scheduled_packets(
         let class_seq = state.next_class_seq.get(&front.class).unwrap_or(&0);
 
         let pkt = make_data_packet(
+            state.node_id,
             state.next_global_seq,
             *class_seq,
             front.class,
             front.declared_bytes,
+            state.desc,
         );
         let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
         let send_time = Instant::now();
@@ -113,7 +119,7 @@ pub fn schedule_burst(
 }
 
 pub fn receive_acks(state: &mut ClientState, socket: &UdpSocket) -> Result<()> {
-    let mut buf = [0u8; 8192]; // Large enough for both ACKs and analytics
+    let mut buf = [0u8; 8192];
 
     loop {
         match socket.recv_from(&mut buf) {
@@ -166,14 +172,19 @@ pub fn send_continuous_packets(
     server_addr: &str,
 ) -> Result<()> {
     if let Some(s) = &mut state.continuous_state {
-        // use a fixed "now" snapshot and catch up missed intervals.
         let now = Instant::now();
 
         while now >= s.next_send_at {
             let class_seq = state.next_class_seq.get(&s.class).unwrap_or(&0);
 
-            // emit one packet per elapsed interval to preserve target rate.
-            let pkt = make_data_packet(state.next_global_seq, *class_seq, s.class, 1200);
+            let pkt = make_data_packet(
+                state.node_id,
+                state.next_global_seq,
+                *class_seq,
+                s.class,
+                1200,
+                state.desc,
+            );
             let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
             let send_time = Instant::now();
             socket.send_to(&bytes, server_addr)?;
@@ -182,8 +193,6 @@ pub fn send_continuous_packets(
             state.next_global_seq = state.next_global_seq.wrapping_add(1);
             let next_class_seq = class_seq.wrapping_add(1);
             state.next_class_seq.insert(s.class, next_class_seq);
-
-            // advance the schedule by exactly one interval (no drift).
             s.next_send_at += s.interval;
         }
     }
@@ -201,7 +210,6 @@ fn display_analytics(snapshot: &AnalyticsSnapshot) {
     out.execute(terminal::Clear(terminal::ClearType::FromCursorDown))
         .ok();
 
-    // Build the entire output string first (use \r\n for raw mode)
     let mut output = String::new();
     output.push_str("=== Analytics Snapshot ===\r\n");
     output.push_str(&format!(
@@ -235,7 +243,13 @@ fn display_analytics(snapshot: &AnalyticsSnapshot) {
     }
 
     if let Some(client) = snapshot.per_client_stats.first() {
-        // Only show latency if we have actual samples (min_rtt != u64::MAX sentinel)
+        output.push_str(&format!(
+            "\r\nClient: id={} desc={} addr={}\r\n",
+            format_node_id_as_uuid(&client.node_id),
+            format_desc(&client.desc),
+            client.addr
+        ));
+
         if client.latency.samples > 0 && client.latency.min_rtt_us != u64::MAX {
             output.push_str(&format!(
                 "\r\nLatency: min={}µs max={}µs avg={:.0}µs\r\n",
@@ -253,8 +267,39 @@ fn display_analytics(snapshot: &AnalyticsSnapshot) {
 
     output.push_str("========================\r\n");
 
-    // Print all at once and flush
     print!("{}", output);
     out.flush().ok();
     out.execute(cursor::RestorePosition).ok();
+}
+
+fn format_node_id_as_uuid(node_id: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        node_id[0],
+        node_id[1],
+        node_id[2],
+        node_id[3],
+        node_id[4],
+        node_id[5],
+        node_id[6],
+        node_id[7],
+        node_id[8],
+        node_id[9],
+        node_id[10],
+        node_id[11],
+        node_id[12],
+        node_id[13],
+        node_id[14],
+        node_id[15],
+    )
+}
+
+fn format_desc(desc: &[u8; 16]) -> String {
+    let rendered = String::from_utf8_lossy(desc);
+    let trimmed = rendered.trim_end_matches('\0');
+    if trimmed.is_empty() {
+        "<empty>".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
