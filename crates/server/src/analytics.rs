@@ -1,7 +1,7 @@
 use crate::client::{LatencyStats, LossEvent, RateCalculator, SequenceTracker};
 use common::{
-    AckPacket, DataPacket, EdgeId, EndpointDomain, NodeDomain, NodeId, RegisterNodePacket,
-    TrafficClass, UnregisterNodePacket,
+    AckPacket, DataPacket, EdgeId, NodeDomain, NodeId, RegisterNodePacket, TrafficClass,
+    UnregisterNodePacket,
 };
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -175,7 +175,7 @@ impl AnalyticsManager {
         node.last_seen = now;
     }
 
-    pub fn on_node_unregistered(&mut self, packet: &UnregisterNodePacket) {
+    pub fn on_node_unregistered(&mut self, packet: &UnregisterNodePacket, _now: Instant) {
         self.remove_node_and_edges(packet.node_id);
     }
 
@@ -185,29 +185,37 @@ impl AnalyticsManager {
         packet: &DataPacket,
         now: Instant,
     ) -> AckPacket {
-        let src_node_id = effective_src_node_id(packet);
-        let dst_node_id = effective_dst_node_id(packet);
-        let src_domain = NodeDomain::from(packet.src_domain);
-        let dst_domain = NodeDomain::from(packet.dst_domain);
+        let src_node_id = packet.src_node_id;
+        let dst_node_id = packet.dst_node_id;
         let class_idx = packet.class as usize;
-        let route_idx = route_index(packet.src_domain, packet.dst_domain);
 
         self.ensure_node(
             src_node_id,
             packet.desc,
-            src_domain,
+            infer_domain(src_node_id),
             src,
             now,
-            packet.src_domain,
+            true,
         );
         self.ensure_node(
             dst_node_id,
-            domain_desc(packet.dst_domain),
-            dst_domain,
+            domain_desc(infer_domain(dst_node_id)),
+            infer_domain(dst_node_id),
             src,
             now,
-            packet.dst_domain,
+            false,
         );
+        let src_domain = self
+            .nodes
+            .get(&src_node_id)
+            .map(|node| node.domain)
+            .unwrap_or_else(|| infer_domain(src_node_id));
+        let dst_domain = self
+            .nodes
+            .get(&dst_node_id)
+            .map(|node| node.domain)
+            .unwrap_or_else(|| infer_domain(dst_node_id));
+        let route_idx = route_index(src_domain, dst_domain);
 
         self.total_packets += 1;
         self.total_bytes += packet.declared_bytes as u64;
@@ -227,7 +235,10 @@ impl AnalyticsManager {
 
             let loss_event = node.seq_trackers[class_idx].process_sequence(packet.class_seq, now);
             if let LossEvent::Loss { count } = loss_event {
-                println!("Loss detected on node {:?}: {} packets missing", src_node_id, count);
+                println!(
+                    "Loss detected on node {:?}: {} packets missing",
+                    src_node_id, count
+                );
             }
 
             node.rate_calculators[class_idx].record_packet(now, packet.declared_bytes);
@@ -250,7 +261,8 @@ impl AnalyticsManager {
         edge.packets += 1;
         edge.bytes += packet.declared_bytes as u64;
         edge.window_packets += 1;
-        edge.rate_calculator.record_packet(now, packet.declared_bytes);
+        edge.rate_calculator
+            .record_packet(now, packet.declared_bytes);
 
         let edge_loss_event = edge.seq_tracker.process_sequence(packet.class_seq, now);
         if let LossEvent::Loss { count } = edge_loss_event {
@@ -323,7 +335,8 @@ impl AnalyticsManager {
                     node_id: node.node_id,
                     desc: node.desc,
                     domain: node.domain,
-                    first_seen_us: node.first_seen.duration_since(self.start_time).as_micros() as u64,
+                    first_seen_us: node.first_seen.duration_since(self.start_time).as_micros()
+                        as u64,
                     last_seen_us: node.last_seen.duration_since(self.start_time).as_micros() as u64,
                     active: now.duration_since(node.last_seen) < activity_ttl,
                     total_packets: node.packets_by_class.iter().sum(),
@@ -403,7 +416,8 @@ impl AnalyticsManager {
                     node_id: node.node_id,
                     desc: node.desc,
                     addr: node.addr.to_string(),
-                    first_seen_us: node.first_seen.duration_since(self.start_time).as_micros() as u64,
+                    first_seen_us: node.first_seen.duration_since(self.start_time).as_micros()
+                        as u64,
                     last_seen_us: node.last_seen.duration_since(self.start_time).as_micros() as u64,
                     session_duration_us: node.last_seen.duration_since(node.first_seen).as_micros()
                         as u64,
@@ -433,29 +447,21 @@ impl AnalyticsManager {
         domain: NodeDomain,
         addr: SocketAddr,
         now: Instant,
-        fallback_domain: EndpointDomain,
+        refresh_desc: bool,
     ) {
         if !self.nodes.contains_key(&node_id) && self.nodes.len() >= self.max_nodes {
             return;
         }
 
         let node = self.nodes.entry(node_id).or_insert_with(|| {
-            NodeState::new(
-                node_id,
-                desc,
-                domain,
-                addr,
-                now,
-                self.rate_window_secs,
-            )
+            NodeState::new(node_id, desc, domain, addr, now, self.rate_window_secs)
         });
 
-        node.desc = desc;
+        if refresh_desc {
+            node.desc = desc;
+        }
         node.addr = addr;
         node.last_seen = now;
-        if node.node_id == common::synthetic_domain_node_id(fallback_domain) {
-            node.domain = NodeDomain::from(fallback_domain);
-        }
     }
 
     fn remove_node_and_edges(&mut self, node_id: NodeId) {
@@ -539,36 +545,30 @@ fn loss_metrics_from_trackers(
     }
 }
 
-fn effective_src_node_id(packet: &DataPacket) -> NodeId {
-    if packet.src_node_id != [0; 16] {
-        packet.src_node_id
-    } else {
-        packet.node_id
-    }
-}
-
-fn effective_dst_node_id(packet: &DataPacket) -> NodeId {
-    if packet.dst_node_id != [0; 16] {
-        packet.dst_node_id
-    } else {
-        common::synthetic_domain_node_id(packet.dst_domain)
-    }
-}
-
-fn domain_desc(domain: EndpointDomain) -> [u8; 16] {
+fn domain_desc(domain: NodeDomain) -> [u8; 16] {
     match domain {
-        EndpointDomain::Internal => *b"internal-node---",
-        EndpointDomain::External => *b"external-node---",
+        NodeDomain::Internal => *b"internal-node---",
+        NodeDomain::External => *b"external-node---",
     }
 }
 
-fn route_index(src_domain: EndpointDomain, dst_domain: EndpointDomain) -> usize {
+fn route_index(src_domain: NodeDomain, dst_domain: NodeDomain) -> usize {
     match (src_domain, dst_domain) {
-        (EndpointDomain::Internal, EndpointDomain::Internal) => 0,
-        (EndpointDomain::Internal, EndpointDomain::External) => 1,
-        (EndpointDomain::External, EndpointDomain::Internal) => 2,
-        (EndpointDomain::External, EndpointDomain::External) => 3,
+        (NodeDomain::Internal, NodeDomain::Internal) => 0,
+        (NodeDomain::Internal, NodeDomain::External) => 1,
+        (NodeDomain::External, NodeDomain::Internal) => 2,
+        (NodeDomain::External, NodeDomain::External) => 3,
     }
+}
+
+fn infer_domain(node_id: NodeId) -> NodeDomain {
+    if &node_id[..4] == b"peer" && node_id[4] == b'e' {
+        return NodeDomain::External;
+    }
+    if &node_id[..4] == b"peer" && node_id[4] == b'i' {
+        return NodeDomain::Internal;
+    }
+    NodeDomain::Internal
 }
 
 fn update_edge_latency(edge: &mut EdgeState, latency_us: f64) {
@@ -622,32 +622,253 @@ fn epoch_timestamp_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::AnalyticsManager;
-    use common::{EndpointDomain, NodeDomain, TrafficClass, WireMessage};
+    use common::{NodeDomain, NodeId, TrafficClass, WireMessage};
     use std::net::SocketAddr;
     use std::str::FromStr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    fn test_addr() -> SocketAddr {
+        SocketAddr::from_str("127.0.0.1:41001").expect("valid socket")
+    }
+
+    fn register_node(
+        analytics: &mut AnalyticsManager,
+        node_id: NodeId,
+        domain: NodeDomain,
+        now: Instant,
+    ) {
+        let desc = if domain == NodeDomain::External {
+            *b"node-external---"
+        } else {
+            *b"node-internal---"
+        };
+        let register = common::make_register_node_packet(node_id, desc, domain);
+        analytics.on_node_registered(&register, test_addr(), now);
+    }
+
+    #[test]
+    fn register_creates_node_with_stable_domain() {
+        let mut analytics = AnalyticsManager::new(5, 100);
+        let now = Instant::now();
+        let src_node_id: NodeId = *b"NODE-ALPHA-00001";
+        let dst_node_id: NodeId = *b"NODE-BRAVO-00002";
+        let addr = test_addr();
+
+        let src_desc = *b"probe-node------";
+        let dst_desc = *b"target-node-----";
+        let src_register =
+            common::make_register_node_packet(src_node_id, src_desc, NodeDomain::External);
+        let dst_register =
+            common::make_register_node_packet(dst_node_id, dst_desc, NodeDomain::Internal);
+        analytics.on_node_registered(&src_register, addr, now);
+        analytics.on_node_registered(&dst_register, addr, now);
+
+        let packet = common::make_data_packet(
+            src_node_id,
+            dst_node_id,
+            1,
+            1,
+            TrafficClass::Api,
+            1200,
+            src_desc,
+        );
+        analytics.on_packet_received(addr, &packet, now + Duration::from_millis(10));
+
+        let snapshot = analytics.export_topology_snapshot(now + Duration::from_millis(20));
+        let src = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == src_node_id)
+            .expect("source node should exist");
+        assert_eq!(src.domain, NodeDomain::External);
+    }
+
+    #[test]
+    fn data_packet_creates_or_updates_edge() {
+        let mut analytics = AnalyticsManager::new(5, 100);
+        let now = Instant::now();
+        let src_node_id: NodeId = *b"NODE-EDGEA-00001";
+        let dst_node_id: NodeId = *b"NODE-EDGEB-00002";
+        let src_desc = *b"src-node--------";
+        let addr = test_addr();
+
+        register_node(&mut analytics, src_node_id, NodeDomain::Internal, now);
+        register_node(&mut analytics, dst_node_id, NodeDomain::External, now);
+
+        let packet1 = common::make_data_packet(
+            src_node_id,
+            dst_node_id,
+            10,
+            1,
+            TrafficClass::Api,
+            1000,
+            src_desc,
+        );
+        let ack1 = analytics.on_packet_received(addr, &packet1, now + Duration::from_millis(10));
+        assert_eq!(ack1.original_seq, 10);
+
+        let packet2 = common::make_data_packet(
+            src_node_id,
+            dst_node_id,
+            11,
+            2,
+            TrafficClass::Api,
+            2000,
+            src_desc,
+        );
+        let ack2 = analytics.on_packet_received(addr, &packet2, now + Duration::from_millis(20));
+        assert_eq!(ack2.original_seq, 11);
+
+        let packet3 = common::make_data_packet(
+            src_node_id,
+            dst_node_id,
+            12,
+            1,
+            TrafficClass::HealthCheck,
+            300,
+            src_desc,
+        );
+        analytics.on_packet_received(addr, &packet3, now + Duration::from_millis(30));
+
+        let snapshot = analytics.export_topology_snapshot(now + Duration::from_millis(40));
+        let api_edge = snapshot
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.src_node_id == src_node_id
+                    && edge.dst_node_id == dst_node_id
+                    && edge.class == TrafficClass::Api
+            })
+            .expect("api edge should exist");
+        assert_eq!(api_edge.packets, 2);
+        assert_eq!(api_edge.bytes, 3000);
+
+        let health_edge = snapshot
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.src_node_id == src_node_id
+                    && edge.dst_node_id == dst_node_id
+                    && edge.class == TrafficClass::HealthCheck
+            })
+            .expect("health edge should exist");
+        assert_eq!(health_edge.packets, 1);
+    }
+
+    #[test]
+    fn cleanup_expires_nodes_and_edges_and_emits_removed_ids() {
+        let mut analytics = AnalyticsManager::new(5, 100);
+        let now = Instant::now();
+        let src_node_id: NodeId = *b"NODE-CLEAN-00001";
+        let dst_node_id: NodeId = *b"NODE-CLEAN-00002";
+        let src_desc = *b"cleanup-source--";
+        let addr = test_addr();
+
+        register_node(&mut analytics, src_node_id, NodeDomain::Internal, now);
+        register_node(&mut analytics, dst_node_id, NodeDomain::External, now);
+
+        let packet = common::make_data_packet(
+            src_node_id,
+            dst_node_id,
+            1,
+            1,
+            TrafficClass::Background,
+            1200,
+            src_desc,
+        );
+        analytics.on_packet_received(addr, &packet, now + Duration::from_millis(10));
+
+        let cleanup_time = now + Duration::from_secs(2);
+        analytics.cleanup_stale(Duration::from_secs(1), Duration::from_secs(1), cleanup_time);
+        let snapshot = analytics.export_topology_snapshot(cleanup_time);
+
+        assert!(snapshot.nodes.is_empty());
+        assert!(snapshot.edges.is_empty());
+        assert_eq!(snapshot.removed_nodes.len(), 2);
+        assert!(snapshot.removed_nodes.contains(&src_node_id));
+        assert!(snapshot.removed_nodes.contains(&dst_node_id));
+        assert_eq!(snapshot.removed_edges.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_contains_delta_rates_and_latency_trends() {
+        let mut analytics = AnalyticsManager::new(5, 100);
+        let now = Instant::now();
+        let src_node_id: NodeId = *b"NODE-LATEN-00001";
+        let dst_node_id: NodeId = *b"NODE-LATEN-00002";
+        let src_desc = *b"latency-source--";
+        let addr = test_addr();
+
+        register_node(&mut analytics, src_node_id, NodeDomain::Internal, now);
+        register_node(&mut analytics, dst_node_id, NodeDomain::External, now);
+
+        let mut packet1 = common::make_data_packet(
+            src_node_id,
+            dst_node_id,
+            1,
+            1,
+            TrafficClass::Api,
+            1200,
+            src_desc,
+        );
+        packet1.timestamp_us = common::now_timestamp_us().saturating_sub(100_000);
+        analytics.on_packet_received(addr, &packet1, now + Duration::from_millis(10));
+
+        let snapshot1 = analytics.export_topology_snapshot(now + Duration::from_millis(100));
+        let edge1 = snapshot1
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.src_node_id == src_node_id
+                    && edge.dst_node_id == dst_node_id
+                    && edge.class == TrafficClass::Api
+            })
+            .expect("edge should exist in snapshot1");
+        assert!(edge1.packets_per_second > 0.0);
+        assert!(edge1.latency_ewma_us > 0.0);
+
+        let mut packet2 = common::make_data_packet(
+            src_node_id,
+            dst_node_id,
+            2,
+            2,
+            TrafficClass::Api,
+            1200,
+            src_desc,
+        );
+        packet2.timestamp_us = common::now_timestamp_us().saturating_sub(1_000);
+        analytics.on_packet_received(addr, &packet2, now + Duration::from_millis(900));
+
+        let snapshot2 = analytics.export_topology_snapshot(now + Duration::from_secs(1));
+        let edge2 = snapshot2
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.src_node_id == src_node_id
+                    && edge.dst_node_id == dst_node_id
+                    && edge.class == TrafficClass::Api
+            })
+            .expect("edge should exist in snapshot2");
+        assert_ne!(edge2.delta_packets_per_second, 0.0);
+        assert_ne!(edge2.latency_delta_us, 0.0);
+        assert!(edge2.jitter_ewma_us > 0.0);
+    }
 
     #[test]
     fn request_topology_wire_roundtrip_includes_graph_state() {
         let mut analytics = AnalyticsManager::new(5, 100);
         let now = Instant::now();
         let node_id = *b"NODE-ALPHA-00001";
+        let dst_node_id = *b"NODE-BRAVO-00002";
         let desc = *b"probe-node------";
-        let addr = SocketAddr::from_str("127.0.0.1:41001").expect("valid socket");
+        let addr = test_addr();
 
         let register = common::make_register_node_packet(node_id, desc, NodeDomain::Internal);
         analytics.on_node_registered(&register, addr, now);
+        register_node(&mut analytics, dst_node_id, NodeDomain::External, now);
 
-        let packet = common::make_data_packet(
-            node_id,
-            1,
-            1,
-            TrafficClass::Api,
-            1200,
-            EndpointDomain::Internal,
-            EndpointDomain::External,
-            desc,
-        );
+        let packet =
+            common::make_data_packet(node_id, dst_node_id, 1, 1, TrafficClass::Api, 1200, desc);
         let ack = analytics.on_packet_received(addr, &packet, now);
         assert_eq!(ack.original_seq, 1);
 

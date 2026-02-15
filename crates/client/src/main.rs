@@ -121,9 +121,9 @@ fn compute_input_timeout(state: &ClientState, now: Instant) -> Duration {
         next_continuous_deadline,
         next_profile_deadline,
     ]
-        .into_iter()
-        .flatten()
-        .min();
+    .into_iter()
+    .flatten()
+    .min();
 
     match next_deadline {
         Some(deadline) => deadline

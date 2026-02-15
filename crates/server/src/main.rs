@@ -1,5 +1,5 @@
-use crate::analytics::AnalyticsManager;
 use common::WireMessage;
+use server::analytics::AnalyticsManager;
 use std::io::{Error, ErrorKind};
 use std::{
     env,
@@ -7,9 +7,6 @@ use std::{
     net::UdpSocket,
     time::{Duration, Instant},
 };
-
-pub mod analytics;
-pub mod client;
 
 fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
     common::encode_message(message).map_err(Error::other)
@@ -83,7 +80,7 @@ fn main() -> Result<()> {
                             println!("Registered node {:?}", packet.node_id);
                         }
                         WireMessage::UnregisterNode(packet) => {
-                            analytics.on_node_unregistered(&packet);
+                            analytics.on_node_unregistered(&packet, Instant::now());
                             println!("Unregistered node {:?}", packet.node_id);
                         }
                         WireMessage::Data(packet) => {

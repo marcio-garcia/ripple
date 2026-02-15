@@ -1,7 +1,7 @@
 use common::{
     EndpointDomain, NodeDomain, NodeId, TrafficClass, WireMessage,
     analytics::{AnalyticsSnapshot, TopologySnapshot},
-    make_data_packet_with_endpoints, make_register_node_packet, make_unregister_node_packet,
+    make_data_packet, make_register_node_packet, make_unregister_node_packet,
 };
 use crossterm::{ExecutableCommand, cursor, terminal};
 use std::{
@@ -27,7 +27,7 @@ pub struct ContinuousState {
 #[derive(Clone, Copy)]
 pub struct PeerNode {
     pub node_id: NodeId,
-    pub domain: EndpointDomain,
+    pub domain: NodeDomain,
     pub desc: [u8; 16],
 }
 
@@ -70,12 +70,12 @@ impl ClientState {
             peers: vec![
                 PeerNode {
                     node_id: *b"peer-internal---",
-                    domain: EndpointDomain::Internal,
+                    domain: NodeDomain::Internal,
                     desc: *b"peer-int-default",
                 },
                 PeerNode {
                     node_id: *b"peer-external---",
-                    domain: EndpointDomain::External,
+                    domain: NodeDomain::External,
                     desc: *b"peer-ext-default",
                 },
             ],
@@ -170,7 +170,7 @@ fn make_peer_id(state: &mut ClientState, domain: EndpointDomain) -> NodeId {
 fn add_peer_local(state: &mut ClientState, domain: EndpointDomain) -> PeerNode {
     let peer = PeerNode {
         node_id: make_peer_id(state, domain),
-        domain,
+        domain: node_domain_from_endpoint_domain(domain),
         desc: make_peer_desc(domain, state.next_peer_counter.saturating_sub(1)),
     };
     state.peers.push(peer);
@@ -179,8 +179,14 @@ fn add_peer_local(state: &mut ClientState, domain: EndpointDomain) -> PeerNode {
     peer
 }
 
-fn select_first_peer_for_domain(state: &mut ClientState, domain: EndpointDomain) -> Option<PeerNode> {
-    let idx = state.peers.iter().position(|peer| peer.domain == domain)?;
+fn select_first_peer_for_domain(
+    state: &mut ClientState,
+    domain: EndpointDomain,
+) -> Option<PeerNode> {
+    let idx = state
+        .peers
+        .iter()
+        .position(|peer| endpoint_domain_from_node_domain(peer.domain) == domain)?;
     state.active_peer_index = idx;
     state.dst_domain = domain;
     state.peers.get(idx).copied()
@@ -188,7 +194,7 @@ fn select_first_peer_for_domain(state: &mut ClientState, domain: EndpointDomain)
 
 fn destination_peer(state: &mut ClientState, requested_domain: EndpointDomain) -> PeerNode {
     if let Some(peer) = active_peer(state) {
-        if peer.domain == requested_domain {
+        if endpoint_domain_from_node_domain(peer.domain) == requested_domain {
             return peer;
         }
     }
@@ -218,20 +224,13 @@ fn render_peer_status(state: &ClientState) -> Result<()> {
             state.active_peer_index + 1,
             state.peers.len(),
             short_node_id(&peer.node_id),
-            format_domain(peer.domain)
+            format_node_domain(peer.domain)
         );
     } else {
         print!("Peer: active=none");
     }
     out.execute(cursor::RestorePosition)?;
     Ok(())
-}
-
-fn format_domain(domain: EndpointDomain) -> &'static str {
-    match domain {
-        EndpointDomain::Internal => "internal",
-        EndpointDomain::External => "external",
-    }
 }
 
 fn endpoint_domain_from_node_domain(domain: NodeDomain) -> EndpointDomain {
@@ -245,6 +244,13 @@ fn node_domain_from_endpoint_domain(domain: EndpointDomain) -> NodeDomain {
     match domain {
         EndpointDomain::Internal => NodeDomain::Internal,
         EndpointDomain::External => NodeDomain::External,
+    }
+}
+
+fn format_node_domain(domain: NodeDomain) -> &'static str {
+    match domain {
+        NodeDomain::Internal => "internal",
+        NodeDomain::External => "external",
     }
 }
 
@@ -267,7 +273,7 @@ pub fn next_peer_node_id(state: &ClientState) -> Option<NodeId> {
 pub fn select_peer(state: &mut ClientState, node_id: NodeId) -> Result<()> {
     if let Some(idx) = state.peers.iter().position(|peer| peer.node_id == node_id) {
         state.active_peer_index = idx;
-        state.dst_domain = state.peers[idx].domain;
+        state.dst_domain = endpoint_domain_from_node_domain(state.peers[idx].domain);
     }
     render_peer_status(state)
 }
@@ -292,21 +298,17 @@ fn send_data_packet(
     server_addr: &str,
     class: TrafficClass,
     declared_bytes: u32,
-    src_domain: EndpointDomain,
     dst_domain: EndpointDomain,
 ) -> Result<()> {
     let class_seq = state.next_class_seq.get(&class).copied().unwrap_or(0);
     let dst_peer = destination_peer(state, dst_domain);
-    let pkt = make_data_packet_with_endpoints(
+    let pkt = make_data_packet(
         state.node_id,
         dst_peer.node_id,
-        state.node_id,
         state.next_global_seq,
         class_seq,
         class,
         declared_bytes,
-        src_domain,
-        dst_peer.domain,
         state.desc,
     );
     let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
@@ -315,7 +317,9 @@ fn send_data_packet(
 
     state.pending_acks.insert(state.next_global_seq, send_time);
     state.next_global_seq = state.next_global_seq.wrapping_add(1);
-    state.next_class_seq.insert(class, class_seq.wrapping_add(1));
+    state
+        .next_class_seq
+        .insert(class, class_seq.wrapping_add(1));
     Ok(())
 }
 
@@ -332,11 +336,7 @@ fn send_register_node(
     Ok(())
 }
 
-fn send_register_self(
-    state: &ClientState,
-    socket: &UdpSocket,
-    server_addr: &str,
-) -> Result<()> {
+fn send_register_self(state: &ClientState, socket: &UdpSocket, server_addr: &str) -> Result<()> {
     send_register_node(
         socket,
         server_addr,
@@ -346,11 +346,7 @@ fn send_register_self(
     )
 }
 
-fn send_unregister_node(
-    socket: &UdpSocket,
-    server_addr: &str,
-    node_id: NodeId,
-) -> Result<()> {
+fn send_unregister_node(socket: &UdpSocket, server_addr: &str, node_id: NodeId) -> Result<()> {
     let pkt = make_unregister_node_packet(node_id);
     let bytes = encode_wire_message(&WireMessage::UnregisterNode(pkt))?;
     socket.send_to(&bytes, server_addr)?;
@@ -390,13 +386,7 @@ pub fn add_peer(
 ) -> Result<()> {
     let endpoint_domain = endpoint_domain_from_node_domain(domain);
     let peer = add_peer_local(state, endpoint_domain);
-    send_register_node(
-        socket,
-        server_addr,
-        peer.node_id,
-        peer.desc,
-        node_domain_from_endpoint_domain(peer.domain),
-    )?;
+    send_register_node(socket, server_addr, peer.node_id, peer.desc, peer.domain)?;
     render_peer_status(state)
 }
 
@@ -420,14 +410,14 @@ pub fn remove_active_peer(
             server_addr,
             replacement.node_id,
             replacement.desc,
-            node_domain_from_endpoint_domain(replacement.domain),
+            replacement.domain,
         )?;
     } else {
         if state.active_peer_index >= state.peers.len() {
             state.active_peer_index = state.peers.len() - 1;
         }
         if let Some(peer) = active_peer(state) {
-            state.dst_domain = peer.domain;
+            state.dst_domain = endpoint_domain_from_node_domain(peer.domain);
         }
     }
 
@@ -442,13 +432,7 @@ pub fn select_or_add_peer_for_domain(
 ) -> Result<()> {
     if select_first_peer_for_domain(state, domain).is_none() {
         let peer = add_peer_local(state, domain);
-        send_register_node(
-            socket,
-            server_addr,
-            peer.node_id,
-            peer.desc,
-            node_domain_from_endpoint_domain(peer.domain),
-        )?;
+        send_register_node(socket, server_addr, peer.node_id, peer.desc, peer.domain)?;
     }
     state.dst_domain = domain;
     render_peer_status(state)
@@ -657,7 +641,6 @@ pub fn send_profile_packets(
                 server_addr,
                 send_class,
                 1200,
-                state.src_domain,
                 state.dst_domain,
             )?;
             continue;
@@ -695,7 +678,6 @@ pub fn run_topology_smoke_test(
         server_addr,
         TrafficClass::Api,
         1200,
-        EndpointDomain::Internal,
         EndpointDomain::External,
     )?;
     request_topology(socket, server_addr)?;
@@ -746,7 +728,6 @@ pub fn run_topology_mixed_classes_test(
             server_addr,
             class,
             1200,
-            EndpointDomain::Internal,
             EndpointDomain::External,
         )?;
     }
@@ -778,7 +759,6 @@ pub fn send_scheduled_packets(
             server_addr,
             front.class,
             front.declared_bytes,
-            state.src_domain,
             state.dst_domain,
         )?;
     }
@@ -873,15 +853,7 @@ pub fn send_continuous_packets(
             break;
         }
 
-        send_data_packet(
-            state,
-            socket,
-            server_addr,
-            class,
-            1200,
-            state.src_domain,
-            state.dst_domain,
-        )?;
+        send_data_packet(state, socket, server_addr, class, 1200, state.dst_domain)?;
 
         if let Some(s) = state.continuous_state.as_mut() {
             s.next_send_at += interval;

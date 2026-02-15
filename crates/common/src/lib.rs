@@ -77,22 +77,14 @@ pub struct UnregisterNodePacket {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DataPacket {
-    /// Source endpoint for the edge. Preferred for topology mode.
     pub src_node_id: NodeId,
-    /// Destination endpoint for the edge. Preferred for topology mode.
     pub dst_node_id: NodeId,
-    /// Legacy sender node id kept for compatibility with existing client controls.
-    pub node_id: NodeId,
     pub global_seq: u32,
     pub class_seq: u32,
     pub class: TrafficClass,
     pub timestamp_us: u64,
     pub declared_bytes: u32,
-    /// Legacy route information kept for compatibility.
-    pub src_domain: EndpointDomain,
-    /// Legacy route information kept for compatibility.
-    pub dst_domain: EndpointDomain,
-    pub desc: [u8; 16],
+    pub desc: [u8; 16], // src label
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -122,52 +114,22 @@ pub fn now_timestamp_us() -> u64 {
 }
 
 pub fn make_data_packet(
-    node_id: NodeId,
-    global_seq: u32,
-    class_seq: u32,
-    class: TrafficClass,
-    declared_bytes: u32,
-    src_domain: EndpointDomain,
-    dst_domain: EndpointDomain,
-    desc: [u8; 16],
-) -> DataPacket {
-    make_data_packet_with_endpoints(
-        node_id,
-        synthetic_domain_node_id(dst_domain),
-        node_id,
-        global_seq,
-        class_seq,
-        class,
-        declared_bytes,
-        src_domain,
-        dst_domain,
-        desc,
-    )
-}
-
-pub fn make_data_packet_with_endpoints(
     src_node_id: NodeId,
     dst_node_id: NodeId,
-    node_id: NodeId,
     global_seq: u32,
     class_seq: u32,
     class: TrafficClass,
     declared_bytes: u32,
-    src_domain: EndpointDomain,
-    dst_domain: EndpointDomain,
     desc: [u8; 16],
 ) -> DataPacket {
     DataPacket {
         src_node_id,
         dst_node_id,
-        node_id,
         global_seq,
         class_seq,
         class,
         timestamp_us: now_timestamp_us(),
         declared_bytes,
-        src_domain,
-        dst_domain,
         desc,
     }
 }
@@ -232,31 +194,28 @@ mod tests {
 
     #[test]
     fn round_trip_data_message() {
-        let node_id: NodeId = *b"ABCDEFGHIJLMNOPQ";
+        let src_node_id: NodeId = *b"ABCDEFGHIJLMNOPQ";
+        let dst_node_id: NodeId = *b"QRSTUVWXYZABCDEF";
         let desc: [u8; 16] = *b"test-node-------";
         let msg = WireMessage::Data(make_data_packet(
-            node_id,
+            src_node_id,
+            dst_node_id,
             10,
             5,
             TrafficClass::Background,
             1200,
-            EndpointDomain::External,
-            EndpointDomain::Internal,
             desc,
         ));
         let bytes = encode_message(&msg).expect("should encode");
         let decoded = decode_message(&bytes).expect("should decode");
         match decoded {
             WireMessage::Data(packet) => {
-                assert_eq!(packet.src_node_id, node_id);
-                assert_eq!(packet.dst_node_id, synthetic_domain_node_id(EndpointDomain::Internal));
-                assert_eq!(packet.node_id, node_id);
+                assert_eq!(packet.src_node_id, src_node_id);
+                assert_eq!(packet.dst_node_id, dst_node_id);
                 assert_eq!(packet.global_seq, 10);
                 assert_eq!(packet.class_seq, 5);
                 assert_eq!(packet.class, TrafficClass::Background);
                 assert_eq!(packet.declared_bytes, 1200);
-                assert_eq!(packet.src_domain, EndpointDomain::External);
-                assert_eq!(packet.dst_domain, EndpointDomain::Internal);
                 assert_eq!(packet.desc, desc);
             }
             _ => panic!("expected data message"),
@@ -342,13 +301,22 @@ mod tests {
                 packets_by_class: [1, 0, 0, 0],
                 bytes_by_class: [1200, 0, 0, 0],
                 route_stats: [
-                    analytics::RouteStats { packets: 0, bytes: 0 },
-                    analytics::RouteStats { packets: 0, bytes: 0 },
+                    analytics::RouteStats {
+                        packets: 0,
+                        bytes: 0,
+                    },
+                    analytics::RouteStats {
+                        packets: 0,
+                        bytes: 0,
+                    },
                     analytics::RouteStats {
                         packets: 1,
                         bytes: 1200,
                     },
-                    analytics::RouteStats { packets: 0, bytes: 0 },
+                    analytics::RouteStats {
+                        packets: 0,
+                        bytes: 0,
+                    },
                 ],
                 unique_clients: 1,
             },
