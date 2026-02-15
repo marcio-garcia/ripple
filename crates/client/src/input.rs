@@ -1,5 +1,5 @@
 use crate::transmission::{ClientState, ContinuousState, schedule_burst};
-use common::{TrafficClass, WireMessage};
+use common::{EndpointDomain, TrafficClass, WireMessage};
 use crossterm::event::KeyCode;
 use std::io::Error;
 use std::{
@@ -15,11 +15,13 @@ pub enum InputCommand {
     StartContinuous { class: TrafficClass, rate: u32 },
     StopContinuous,
     RequestAnalytics,
+    SetSourceDomain(EndpointDomain),
+    SetDestinationDomain(EndpointDomain),
 }
 
 pub fn handle_input(key: KeyCode) -> Option<InputCommand> {
     match key {
-        KeyCode::Char(c) => match c {
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
             ' ' => Some(InputCommand::SendSingle),
             'b' => Some(InputCommand::SendBurst),
             '1'..='9' => {
@@ -40,6 +42,10 @@ pub fn handle_input(key: KeyCode) -> Option<InputCommand> {
             }),
             's' => Some(InputCommand::StopContinuous),
             'r' => Some(InputCommand::RequestAnalytics),
+            'i' => Some(InputCommand::SetSourceDomain(EndpointDomain::Internal)),
+            'e' => Some(InputCommand::SetSourceDomain(EndpointDomain::External)),
+            'k' => Some(InputCommand::SetDestinationDomain(EndpointDomain::Internal)),
+            'l' => Some(InputCommand::SetDestinationDomain(EndpointDomain::External)),
             _ => None,
         },
         _ => None,
@@ -104,5 +110,25 @@ pub fn execute_command(
             print!("Requesting analytics...");
             Ok(())
         }
+        InputCommand::SetSourceDomain(domain) => {
+            state.src_domain = domain;
+            print!("Source domain now: {}", format_domain(state.src_domain));
+            Ok(())
+        }
+        InputCommand::SetDestinationDomain(domain) => {
+            state.dst_domain = domain;
+            print!(
+                "Destination domain now: {}",
+                format_domain(state.dst_domain)
+            );
+            Ok(())
+        }
+    }
+}
+
+fn format_domain(domain: EndpointDomain) -> &'static str {
+    match domain {
+        EndpointDomain::Internal => "internal",
+        EndpointDomain::External => "external",
     }
 }

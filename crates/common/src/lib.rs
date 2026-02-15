@@ -27,6 +27,13 @@ impl Display for TrafficClass {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum EndpointDomain {
+    Internal = 0,
+    External = 1,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DataPacket {
     pub node_id: ClientId,
@@ -35,6 +42,8 @@ pub struct DataPacket {
     pub class: TrafficClass,
     pub timestamp_us: u64,
     pub declared_bytes: u32,
+    pub src_domain: EndpointDomain,
+    pub dst_domain: EndpointDomain,
     pub desc: [u8; 16],
 }
 
@@ -66,6 +75,8 @@ pub fn make_data_packet(
     class_seq: u32,
     class: TrafficClass,
     declared_bytes: u32,
+    src_domain: EndpointDomain,
+    dst_domain: EndpointDomain,
     desc: [u8; 16],
 ) -> DataPacket {
     DataPacket {
@@ -75,6 +86,8 @@ pub fn make_data_packet(
         class,
         timestamp_us: now_timestamp_us(),
         declared_bytes,
+        src_domain,
+        dst_domain,
         desc,
     }
 }
@@ -101,6 +114,8 @@ mod tests {
             5,
             TrafficClass::Background,
             1200,
+            EndpointDomain::External,
+            EndpointDomain::Internal,
             desc,
         ));
         let bytes = encode_message(&msg).expect("should encode");
@@ -112,6 +127,8 @@ mod tests {
                 assert_eq!(packet.class_seq, 5);
                 assert_eq!(packet.class, TrafficClass::Background);
                 assert_eq!(packet.declared_bytes, 1200);
+                assert_eq!(packet.src_domain, EndpointDomain::External);
+                assert_eq!(packet.dst_domain, EndpointDomain::Internal);
                 assert_eq!(packet.desc, desc);
             }
             _ => panic!("expected data message"),

@@ -30,6 +30,10 @@ pub struct GlobalStats {
     /// Bytes broken down by traffic class
     pub bytes_by_class: [u64; 4],
 
+    /// Packets/bytes grouped by route:
+    /// [internal->internal, internal->external, external->internal, external->external]
+    pub route_stats: [RouteStats; 4],
+
     /// Number of unique client addresses seen
     pub unique_clients: usize,
 }
@@ -62,6 +66,16 @@ pub struct ClientStats {
 
     /// Packet loss detection results
     pub loss: LossMetrics,
+
+    /// Packets/bytes grouped by route:
+    /// [internal->internal, internal->external, external->internal, external->external]
+    pub route_stats: [RouteStats; 4],
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+pub struct RouteStats {
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]

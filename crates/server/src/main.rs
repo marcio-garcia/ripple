@@ -4,6 +4,7 @@ use std::io::{Error, ErrorKind};
 use std::{env, io::Result, net::UdpSocket, time::Instant};
 
 pub mod analytics;
+pub mod client;
 
 fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
     common::encode_message(message).map_err(Error::other)

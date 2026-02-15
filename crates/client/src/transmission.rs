@@ -1,4 +1,7 @@
-use common::{ClientId, TrafficClass, WireMessage, analytics::AnalyticsSnapshot, make_data_packet};
+use common::{
+    ClientId, EndpointDomain, TrafficClass, WireMessage, analytics::AnalyticsSnapshot,
+    make_data_packet,
+};
 use crossterm::{ExecutableCommand, cursor, terminal};
 use std::{
     collections::{HashMap, VecDeque},
@@ -23,6 +26,8 @@ pub struct ContinuousState {
 pub struct ClientState {
     pub node_id: ClientId,
     pub desc: [u8; 16],
+    pub src_domain: EndpointDomain,
+    pub dst_domain: EndpointDomain,
     pub burst_count: u32,
     pub next_global_seq: u32,
     pub next_class_seq: HashMap<TrafficClass, u32>,
@@ -45,6 +50,8 @@ impl ClientState {
         Self {
             node_id,
             desc,
+            src_domain: EndpointDomain::External,
+            dst_domain: EndpointDomain::Internal,
             burst_count: 200,
             next_global_seq: 0,
             next_class_seq: init_class_seq,
@@ -85,6 +92,8 @@ pub fn send_scheduled_packets(
             *class_seq,
             front.class,
             front.declared_bytes,
+            state.src_domain,
+            state.dst_domain,
             state.desc,
         );
         let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
@@ -137,7 +146,7 @@ pub fn receive_acks(state: &mut ClientState, socket: &UdpSocket) -> Result<()> {
 
                                 let mut out = stdout();
                                 out.execute(cursor::SavePosition)?;
-                                out.execute(cursor::MoveTo(0, 2))?;
+                                out.execute(cursor::MoveTo(0, 4))?;
                                 out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
                                 print!(
                                     "Stats: ACK seq={:5} | RTT={:4}µs | min={:4} max={:4} avg={:4}",
@@ -183,6 +192,8 @@ pub fn send_continuous_packets(
                 *class_seq,
                 s.class,
                 1200,
+                state.src_domain,
+                state.dst_domain,
                 state.desc,
             );
             let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
@@ -249,6 +260,17 @@ fn display_analytics(snapshot: &AnalyticsSnapshot) {
             format_desc(&client.desc),
             client.addr
         ));
+        output.push_str("Routes:\r\n");
+        for (i, route) in client.route_stats.iter().enumerate() {
+            if route.packets > 0 {
+                output.push_str(&format!(
+                    "  {}: {} packets, {} bytes\r\n",
+                    route_label(i),
+                    route.packets,
+                    route.bytes
+                ));
+            }
+        }
 
         if client.latency.samples > 0 && client.latency.min_rtt_us != u64::MAX {
             output.push_str(&format!(
@@ -301,5 +323,15 @@ fn format_desc(desc: &[u8; 16]) -> String {
         "<empty>".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+fn route_label(index: usize) -> &'static str {
+    match index {
+        0 => "internal->internal",
+        1 => "internal->external",
+        2 => "external->internal",
+        3 => "external->external",
+        _ => "unknown",
     }
 }

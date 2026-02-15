@@ -3,6 +3,7 @@ use crate::input::{execute_command, handle_input};
 use crate::transmission::{
     ClientState, receive_acks, send_continuous_packets, send_scheduled_packets,
 };
+use common::EndpointDomain;
 use crossterm::{
     ExecutableCommand, cursor,
     cursor::{MoveToColumn, MoveToNextLine},
@@ -48,7 +49,9 @@ fn main() -> Result<()> {
     stdout.execute(MoveToNextLine(1))?;
     print!("Send to: {}", &server_addr);
     stdout.execute(MoveToNextLine(1))?;
-    print!("Commands: Space=send | B=burst | 1-9=count | Q=quit");
+    print!("Commands: Space=send | B=burst | 1-9=count | I/E=src | K/L=dst | Q=quit");
+    stdout.execute(MoveToNextLine(1))?;
+    print!("Mode: src=external dst=internal");
     stdout.execute(MoveToNextLine(1))?;
     print!("Stats: [waiting for ACKs...]");
 
@@ -76,6 +79,7 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
             }
         }
 
+        render_domain_status(&state)?;
         stdout().execute(MoveToColumn(0))?;
 
         send_scheduled_packets(&mut state, &socket, server_addr, Instant::now())?;
@@ -120,6 +124,27 @@ fn get_input(timeout: Duration) -> Result<Option<KeyCode>> {
         }
     }
     Ok(None)
+}
+
+fn render_domain_status(state: &ClientState) -> Result<()> {
+    let mut out = stdout();
+    out.execute(cursor::SavePosition)?;
+    out.execute(cursor::MoveTo(0, 3))?;
+    out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
+    print!(
+        "Mode: src={} dst={}",
+        format_domain(state.src_domain),
+        format_domain(state.dst_domain)
+    );
+    out.execute(cursor::RestorePosition)?;
+    Ok(())
+}
+
+fn format_domain(domain: EndpointDomain) -> &'static str {
+    match domain {
+        EndpointDomain::Internal => "internal",
+        EndpointDomain::External => "external",
+    }
 }
 
 fn load_or_create_client_id(path: &Path) -> std::io::Result<common::ClientId> {
