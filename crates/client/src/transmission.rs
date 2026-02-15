@@ -1,5 +1,5 @@
 use common::{
-    ClientId, EndpointDomain, TrafficClass, WireMessage, analytics::AnalyticsSnapshot,
+    NodeId, EndpointDomain, TrafficClass, WireMessage, analytics::AnalyticsSnapshot,
     make_data_packet,
 };
 use crossterm::{ExecutableCommand, cursor, terminal};
@@ -24,7 +24,7 @@ pub struct ContinuousState {
 }
 
 pub struct ClientState {
-    pub node_id: ClientId,
+    pub node_id: NodeId,
     pub desc: [u8; 16],
     pub src_domain: EndpointDomain,
     pub dst_domain: EndpointDomain,
@@ -41,7 +41,7 @@ pub struct ClientState {
 }
 
 impl ClientState {
-    pub fn new(node_id: ClientId, desc: [u8; 16]) -> Self {
+    pub fn new(node_id: NodeId, desc: [u8; 16]) -> Self {
         let mut init_class_seq = HashMap::new();
         init_class_seq.insert(TrafficClass::Api, 0);
         init_class_seq.insert(TrafficClass::Background, 0);

@@ -1,4 +1,4 @@
-use common::{AckPacket, ClientId, DataPacket, EndpointDomain};
+use common::{AckPacket, DataPacket, EndpointDomain, NodeId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
@@ -11,7 +11,7 @@ pub struct AnalyticsManager {
     start_time: Instant,
 
     /// All connected clients, keyed by stable node id
-    clients: HashMap<ClientId, Client>,
+    clients: HashMap<NodeId, Client>,
 
     /// Global counters
     total_packets: u64,

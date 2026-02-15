@@ -4,11 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::ClientId;
+use common::NodeId;
 
 /// State for a single client
 pub struct Client {
-    pub node_id: ClientId,
+    pub node_id: NodeId,
     pub desc: [u8; 16],
     pub addr: SocketAddr,
     pub first_seen: Instant,
@@ -24,7 +24,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(
-        node_id: ClientId,
+        node_id: NodeId,
         desc: [u8; 16],
         addr: SocketAddr,
         now: Instant,

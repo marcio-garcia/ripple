@@ -49,7 +49,6 @@ dependencies = [
  "crossterm",
  "postcard",
  "serde",
- "uuid",
 ]
 
 [[package]]
@@ -67,6 +66,7 @@ version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
+ "uuid",
 ]
 
 [[package]]

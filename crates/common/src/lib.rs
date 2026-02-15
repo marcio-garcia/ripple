@@ -1,10 +1,11 @@
-use std::{fmt::Display, time::SystemTime};
+use std::{fmt::Display, path::Path, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub mod analytics;
 
-pub type ClientId = [u8; 16];
+pub type NodeId = [u8; 16];
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -36,7 +37,7 @@ pub enum EndpointDomain {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DataPacket {
-    pub node_id: ClientId,
+    pub node_id: NodeId,
     pub global_seq: u32,
     pub class_seq: u32,
     pub class: TrafficClass,
@@ -70,7 +71,7 @@ pub fn now_timestamp_us() -> u64 {
 }
 
 pub fn make_data_packet(
-    node_id: ClientId,
+    node_id: NodeId,
     global_seq: u32,
     class_seq: u32,
     class: TrafficClass,
@@ -100,13 +101,32 @@ pub fn decode_message(bytes: &[u8]) -> postcard::Result<WireMessage> {
     postcard::from_bytes(bytes)
 }
 
+pub fn load_or_create_id(path: &Path) -> std::io::Result<NodeId> {
+    if path.exists() {
+        let existing = std::fs::read_to_string(path)?;
+        if let Ok(parsed) = Uuid::parse_str(existing.trim()) {
+            return Ok(*parsed.as_bytes());
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let id = Uuid::new_v4();
+    std::fs::write(path, format!("{id}\n"))?;
+    Ok(*id.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn round_trip_data_message() {
-        let node_id: ClientId = *b"ABCDEFGHIJLMNOPQ";
+        let node_id: NodeId = *b"ABCDEFGHIJLMNOPQ";
         let desc: [u8; 16] = *b"test-node-------";
         let msg = WireMessage::Data(make_data_packet(
             node_id,

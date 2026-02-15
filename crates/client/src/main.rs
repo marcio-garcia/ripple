@@ -3,7 +3,7 @@ use crate::input::{execute_command, handle_input};
 use crate::transmission::{
     ClientState, receive_acks, send_continuous_packets, send_scheduled_packets,
 };
-use common::EndpointDomain;
+use common::{EndpointDomain, load_or_create_id};
 use crossterm::{
     ExecutableCommand, cursor,
     cursor::{MoveToColumn, MoveToNextLine},
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
 }
 
 fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
-    let node_id = load_or_create_client_id(Path::new("client_id.txt"))?;
+    let node_id = load_or_create_id(Path::new("client_id.txt"))?;
     let mut state = ClientState::new(node_id, DEFAULT_DESC);
 
     loop {
@@ -145,23 +145,4 @@ fn format_domain(domain: EndpointDomain) -> &'static str {
         EndpointDomain::Internal => "internal",
         EndpointDomain::External => "external",
     }
-}
-
-fn load_or_create_client_id(path: &Path) -> std::io::Result<common::ClientId> {
-    if path.exists() {
-        let existing = std::fs::read_to_string(path)?;
-        if let Ok(parsed) = Uuid::parse_str(existing.trim()) {
-            return Ok(*parsed.as_bytes());
-        }
-    }
-
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let id = Uuid::new_v4();
-    std::fs::write(path, format!("{id}\n"))?;
-    Ok(*id.as_bytes())
 }
