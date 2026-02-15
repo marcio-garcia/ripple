@@ -1,8 +1,8 @@
 use crate::cli::parse_server_addr_args;
 use crate::input::{execute_command, handle_input};
 use crate::transmission::{
-    ClientState, receive_acks, register_self, send_continuous_packets, send_scheduled_packets,
-    unregister_self,
+    ClientState, next_profile_deadline, receive_acks, register_self, send_continuous_packets,
+    send_profile_packets, send_scheduled_packets, unregister_self,
 };
 use common::{EndpointDomain, load_or_create_id};
 use crossterm::{
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     print!("Send to: {}", &server_addr);
     stdout.execute(MoveToNextLine(1))?;
     print!(
-        "Commands: Space=send | B=burst | 1-9=count | I/E=src | K/L=dst | N/C/M=peer add/cycle/remove | T/Y/U=topology tests | P=topology | Q=quit"
+        "Commands: Space=send | B=burst | 1-9=count | V/X=reg/unreg | N/J=add peer | C=select next | M=remove | F/Z/W/O=profiles | I/E=src | K/L=dst | T/Y/U=topology tests | P=topology | Q=quit"
     );
     stdout.execute(MoveToNextLine(1))?;
     print!("Mode: src=external dst=internal");
@@ -60,6 +60,8 @@ fn main() -> Result<()> {
     print!("Topology: [no snapshot yet]");
     stdout.execute(MoveToNextLine(1))?;
     print!("Peer: active=1/2 id=70656572 domain=internal");
+    stdout.execute(MoveToNextLine(1))?;
+    print!("Profile: none");
 
     let socket = open_socket().expect("Couldn't open socket");
     socket.set_nonblocking(true).expect("error on non blocking");
@@ -82,7 +84,7 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
                     break;
                 }
                 _ => {
-                    if let Some(command) = handle_input(key) {
+                    if let Some(command) = handle_input(key, &state) {
                         execute_command(command, &mut state, &socket, server_addr)?;
                     }
                 }
@@ -94,6 +96,7 @@ fn run_app(socket: UdpSocket, server_addr: &str) -> Result<()> {
 
         send_scheduled_packets(&mut state, &socket, server_addr, Instant::now())?;
         send_continuous_packets(&mut state, &socket, server_addr)?;
+        send_profile_packets(&mut state, &socket, server_addr)?;
         receive_acks(&mut state, &socket)?;
     }
 
@@ -111,8 +114,13 @@ fn compute_input_timeout(state: &ClientState, now: Instant) -> Duration {
         .continuous_state
         .as_ref()
         .map(|continuous| continuous.next_send_at);
+    let next_profile_deadline = next_profile_deadline(state);
 
-    let next_deadline = [next_burst_deadline, next_continuous_deadline]
+    let next_deadline = [
+        next_burst_deadline,
+        next_continuous_deadline,
+        next_profile_deadline,
+    ]
         .into_iter()
         .flatten()
         .min();

@@ -50,6 +50,7 @@ pub struct ClientState {
     pub max_rtt: Duration,
     pub sum_rtt: Duration,
     pub continuous_state: Option<ContinuousState>,
+    pub active_profile: Option<ActiveProfile>,
     pub pending_topology_expectation: Option<TopologyExpectation>,
 }
 
@@ -90,6 +91,7 @@ impl ClientState {
             max_rtt: Duration::ZERO,
             sum_rtt: Duration::ZERO,
             continuous_state: None,
+            active_profile: None,
             pending_topology_expectation: None,
         }
     }
@@ -100,6 +102,35 @@ pub enum TopologyExpectation {
     Smoke { node_id: NodeId },
     Removal { node_id: NodeId },
     MixedClasses { node_id: NodeId },
+}
+
+#[derive(Clone, Copy)]
+pub enum ActiveProfile {
+    Steady {
+        class: TrafficClass,
+        rate: u32,
+        next_send_at: Instant,
+    },
+    Ramp {
+        class: TrafficClass,
+        min_rate: u32,
+        max_rate: u32,
+        step: u32,
+        current_rate: u32,
+        next_send_at: Instant,
+        next_rate_update_at: Instant,
+        update_interval: Duration,
+    },
+    Oscillation {
+        class: TrafficClass,
+        low_rate: u32,
+        high_rate: u32,
+        current_rate: u32,
+        rising: bool,
+        next_send_at: Instant,
+        next_rate_update_at: Instant,
+        update_interval: Duration,
+    },
 }
 
 fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
@@ -203,6 +234,58 @@ fn format_domain(domain: EndpointDomain) -> &'static str {
     }
 }
 
+fn endpoint_domain_from_node_domain(domain: NodeDomain) -> EndpointDomain {
+    match domain {
+        NodeDomain::Internal => EndpointDomain::Internal,
+        NodeDomain::External => EndpointDomain::External,
+    }
+}
+
+fn node_domain_from_endpoint_domain(domain: EndpointDomain) -> NodeDomain {
+    match domain {
+        EndpointDomain::Internal => NodeDomain::Internal,
+        EndpointDomain::External => NodeDomain::External,
+    }
+}
+
+fn interval_from_rate(rate: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / rate.max(1) as f64)
+}
+
+pub fn active_peer_node_id(state: &ClientState) -> Option<NodeId> {
+    active_peer(state).map(|peer| peer.node_id)
+}
+
+pub fn next_peer_node_id(state: &ClientState) -> Option<NodeId> {
+    if state.peers.is_empty() {
+        return None;
+    }
+    let idx = (state.active_peer_index + 1) % state.peers.len();
+    state.peers.get(idx).map(|peer| peer.node_id)
+}
+
+pub fn select_peer(state: &mut ClientState, node_id: NodeId) -> Result<()> {
+    if let Some(idx) = state.peers.iter().position(|peer| peer.node_id == node_id) {
+        state.active_peer_index = idx;
+        state.dst_domain = state.peers[idx].domain;
+    }
+    render_peer_status(state)
+}
+
+pub fn remove_peer(
+    state: &mut ClientState,
+    node_id: NodeId,
+    socket: &UdpSocket,
+    server_addr: &str,
+) -> Result<()> {
+    if let Some(idx) = state.peers.iter().position(|peer| peer.node_id == node_id) {
+        state.active_peer_index = idx;
+        remove_active_peer(state, socket, server_addr)
+    } else {
+        render_peer_status(state)
+    }
+}
+
 fn send_data_packet(
     state: &mut ClientState,
     socket: &UdpSocket,
@@ -295,36 +378,25 @@ pub fn update_source_domain(
     server_addr: &str,
 ) -> Result<()> {
     state.src_domain = domain;
-    state.node_domain = NodeDomain::from(domain);
+    state.node_domain = node_domain_from_endpoint_domain(domain);
     register_self(state, socket, server_addr)
 }
 
 pub fn add_peer(
     state: &mut ClientState,
-    domain: EndpointDomain,
+    domain: NodeDomain,
     socket: &UdpSocket,
     server_addr: &str,
 ) -> Result<()> {
-    let peer = add_peer_local(state, domain);
+    let endpoint_domain = endpoint_domain_from_node_domain(domain);
+    let peer = add_peer_local(state, endpoint_domain);
     send_register_node(
         socket,
         server_addr,
         peer.node_id,
         peer.desc,
-        NodeDomain::from(peer.domain),
+        node_domain_from_endpoint_domain(peer.domain),
     )?;
-    render_peer_status(state)
-}
-
-pub fn cycle_active_peer(state: &mut ClientState) -> Result<()> {
-    if state.peers.is_empty() {
-        render_peer_status(state)?;
-        return Ok(());
-    }
-    state.active_peer_index = (state.active_peer_index + 1) % state.peers.len();
-    if let Some(peer) = active_peer(state) {
-        state.dst_domain = peer.domain;
-    }
     render_peer_status(state)
 }
 
@@ -348,7 +420,7 @@ pub fn remove_active_peer(
             server_addr,
             replacement.node_id,
             replacement.desc,
-            NodeDomain::from(replacement.domain),
+            node_domain_from_endpoint_domain(replacement.domain),
         )?;
     } else {
         if state.active_peer_index >= state.peers.len() {
@@ -375,11 +447,236 @@ pub fn select_or_add_peer_for_domain(
             server_addr,
             peer.node_id,
             peer.desc,
-            NodeDomain::from(peer.domain),
+            node_domain_from_endpoint_domain(peer.domain),
         )?;
     }
     state.dst_domain = domain;
     render_peer_status(state)
+}
+
+pub fn set_profile_steady(state: &mut ClientState) -> Result<()> {
+    state.queue.clear();
+    state.continuous_state = None;
+    state.active_profile = Some(ActiveProfile::Steady {
+        class: TrafficClass::Api,
+        rate: 80,
+        next_send_at: Instant::now() + interval_from_rate(80),
+    });
+    render_profile_status("Profile: steady (api @ 80pps)")
+}
+
+pub fn set_profile_burst(state: &mut ClientState) -> Result<()> {
+    state.active_profile = None;
+    state.continuous_state = None;
+    schedule_burst(
+        &mut state.queue,
+        Instant::now(),
+        state.burst_count,
+        2,
+        TrafficClass::Background,
+        1200,
+    );
+    render_profile_status("Profile: burst (queued)")
+}
+
+pub fn set_profile_ramp(state: &mut ClientState) -> Result<()> {
+    let current_rate = 20;
+    state.queue.clear();
+    state.continuous_state = None;
+    state.active_profile = Some(ActiveProfile::Ramp {
+        class: TrafficClass::HeavyCompute,
+        min_rate: 20,
+        max_rate: 220,
+        step: 20,
+        current_rate,
+        next_send_at: Instant::now() + interval_from_rate(current_rate),
+        next_rate_update_at: Instant::now() + Duration::from_secs(1),
+        update_interval: Duration::from_secs(1),
+    });
+    render_profile_status("Profile: ramp (heavy compute 20->220pps)")
+}
+
+pub fn set_profile_oscillation(state: &mut ClientState) -> Result<()> {
+    let current_rate = 40;
+    state.queue.clear();
+    state.continuous_state = None;
+    state.active_profile = Some(ActiveProfile::Oscillation {
+        class: TrafficClass::Api,
+        low_rate: 40,
+        high_rate: 240,
+        current_rate,
+        rising: true,
+        next_send_at: Instant::now() + interval_from_rate(current_rate),
+        next_rate_update_at: Instant::now() + Duration::from_secs(1),
+        update_interval: Duration::from_secs(1),
+    });
+    render_profile_status("Profile: oscillation (api 40<->240pps)")
+}
+
+pub fn clear_profile(state: &mut ClientState) -> Result<()> {
+    state.active_profile = None;
+    render_profile_status("Profile: none")
+}
+
+pub fn next_profile_deadline(state: &ClientState) -> Option<Instant> {
+    match state.active_profile {
+        Some(ActiveProfile::Steady { next_send_at, .. }) => Some(next_send_at),
+        Some(ActiveProfile::Ramp {
+            next_send_at,
+            next_rate_update_at,
+            ..
+        }) => Some(next_send_at.min(next_rate_update_at)),
+        Some(ActiveProfile::Oscillation {
+            next_send_at,
+            next_rate_update_at,
+            ..
+        }) => Some(next_send_at.min(next_rate_update_at)),
+        None => None,
+    }
+}
+
+pub fn send_profile_packets(
+    state: &mut ClientState,
+    socket: &UdpSocket,
+    server_addr: &str,
+) -> Result<()> {
+    loop {
+        let now = Instant::now();
+        let snapshot = match state.active_profile {
+            Some(profile) => profile,
+            None => break,
+        };
+
+        let mut should_send = false;
+        let mut send_class = TrafficClass::Api;
+
+        match snapshot {
+            ActiveProfile::Steady {
+                class,
+                rate,
+                next_send_at,
+            } => {
+                if now >= next_send_at {
+                    should_send = true;
+                    send_class = class;
+                    if let Some(ActiveProfile::Steady { next_send_at, .. }) =
+                        state.active_profile.as_mut()
+                    {
+                        *next_send_at += interval_from_rate(rate);
+                    }
+                }
+            }
+            ActiveProfile::Ramp {
+                class,
+                min_rate,
+                max_rate,
+                step,
+                current_rate,
+                next_send_at,
+                next_rate_update_at,
+                update_interval,
+            } => {
+                if now >= next_rate_update_at {
+                    let next_rate = if current_rate + step > max_rate {
+                        min_rate
+                    } else {
+                        current_rate + step
+                    };
+                    if let Some(ActiveProfile::Ramp {
+                        current_rate,
+                        next_rate_update_at,
+                        ..
+                    }) = state.active_profile.as_mut()
+                    {
+                        *current_rate = next_rate;
+                        *next_rate_update_at += update_interval;
+                    }
+                }
+                if now >= next_send_at {
+                    should_send = true;
+                    send_class = class;
+                    let next_rate = match state.active_profile {
+                        Some(ActiveProfile::Ramp { current_rate, .. }) => current_rate,
+                        _ => current_rate,
+                    };
+                    if let Some(ActiveProfile::Ramp { next_send_at, .. }) =
+                        state.active_profile.as_mut()
+                    {
+                        *next_send_at += interval_from_rate(next_rate);
+                    }
+                }
+            }
+            ActiveProfile::Oscillation {
+                class,
+                low_rate,
+                high_rate,
+                current_rate,
+                rising,
+                next_send_at,
+                next_rate_update_at,
+                update_interval,
+            } => {
+                if now >= next_rate_update_at {
+                    let (next_rate, next_rising) = if rising {
+                        (high_rate, false)
+                    } else {
+                        (low_rate, true)
+                    };
+                    if let Some(ActiveProfile::Oscillation {
+                        current_rate,
+                        rising,
+                        next_rate_update_at,
+                        ..
+                    }) = state.active_profile.as_mut()
+                    {
+                        *current_rate = next_rate;
+                        *rising = next_rising;
+                        *next_rate_update_at += update_interval;
+                    }
+                }
+                if now >= next_send_at {
+                    should_send = true;
+                    send_class = class;
+                    let next_rate = match state.active_profile {
+                        Some(ActiveProfile::Oscillation { current_rate, .. }) => current_rate,
+                        _ => current_rate,
+                    };
+                    if let Some(ActiveProfile::Oscillation { next_send_at, .. }) =
+                        state.active_profile.as_mut()
+                    {
+                        *next_send_at += interval_from_rate(next_rate);
+                    }
+                }
+            }
+        }
+
+        if should_send {
+            send_data_packet(
+                state,
+                socket,
+                server_addr,
+                send_class,
+                1200,
+                state.src_domain,
+                state.dst_domain,
+            )?;
+            continue;
+        }
+
+        break;
+    }
+
+    Ok(())
+}
+
+fn render_profile_status(message: &str) -> Result<()> {
+    let mut out = stdout();
+    out.execute(cursor::SavePosition)?;
+    out.execute(cursor::MoveTo(0, 7))?;
+    out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
+    print!("{message}");
+    out.execute(cursor::RestorePosition)?;
+    Ok(())
 }
 
 pub fn run_topology_smoke_test(
