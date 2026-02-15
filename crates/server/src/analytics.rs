@@ -1,7 +1,7 @@
+use common::{AckPacket, DataPacket};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
-use common::{AckPacket, DataPacket};
 
 /// Main analytics engine tracking all clients and stats
 pub struct AnalyticsManager {
@@ -18,9 +18,9 @@ pub struct AnalyticsManager {
     bytes_by_class: [u64; 4],
 
     /// Configuration
-    rate_window_secs: u32,  // 5 seconds
+    rate_window_secs: u32, // 5 seconds
     #[allow(dead_code)]
-    max_clients: usize,     // Prevent unbounded growth (e.g., 1000) - reserved for future use
+    max_clients: usize, // Prevent unbounded growth (e.g., 1000) - reserved for future use
 }
 
 impl AnalyticsManager {
@@ -41,10 +41,11 @@ impl AnalyticsManager {
         &mut self,
         src: SocketAddr,
         packet: &DataPacket,
-        now: Instant
+        now: Instant,
     ) -> AckPacket {
         // Get or create client state
-        let client = self.clients
+        let client = self
+            .clients
             .entry(src)
             .or_insert_with(|| ClientState::new(src, now, self.rate_window_secs));
 
@@ -63,8 +64,7 @@ impl AnalyticsManager {
         client.bytes_by_class[class_idx] += packet.declared_bytes as u64;
 
         // Process sequence - detect packet loss
-        let loss_event = client.seq_trackers[class_idx]
-            .process_sequence(packet.class_seq, now);
+        let loss_event = client.seq_trackers[class_idx].process_sequence(packet.class_seq, now);
 
         // Log loss events
         match loss_event {
@@ -75,8 +75,7 @@ impl AnalyticsManager {
         }
 
         // 6. Record packet in rate calculator
-        client.rate_calculators[class_idx]
-            .record_packet(now, packet.declared_bytes);
+        client.rate_calculators[class_idx].record_packet(now, packet.declared_bytes);
 
         // 7. Calculate one-way latency (client timestamp → server receive time)
         // Use absolute wall-clock time (UNIX epoch) for accurate latency
@@ -97,7 +96,7 @@ impl AnalyticsManager {
         AckPacket {
             original_seq: packet.global_seq,
             server_timestamp_us,
-            server_processing_us: 0,  // Could measure actual processing time if needed
+            server_processing_us: 0, // Could measure actual processing time if needed
         }
     }
 
@@ -105,9 +104,8 @@ impl AnalyticsManager {
         let now = Instant::now();
 
         // Remove clients where last_seen is older than timeout
-        self.clients.retain(|_addr, client| {
-            now.duration_since(client.last_seen) < timeout
-        });
+        self.clients
+            .retain(|_addr, client| now.duration_since(client.last_seen) < timeout);
     }
 
     pub fn export_snapshot(&self) -> common::analytics::AnalyticsSnapshot {
@@ -124,10 +122,12 @@ impl AnalyticsManager {
         };
 
         // Build per-client stats
-        let per_client_stats: Vec<_> = self.clients.iter().map(|(addr, client)| {
-            // For each client, build ClassStats array
-            let class_stats: [common::analytics::ClassStats; 4] =
-                std::array::from_fn(|i| {
+        let per_client_stats: Vec<_> = self
+            .clients
+            .iter()
+            .map(|(addr, client)| {
+                // For each client, build ClassStats array
+                let class_stats: [common::analytics::ClassStats; 4] = std::array::from_fn(|i| {
                     let (pps, bps) = client.rate_calculators[i].calculate_rate(now);
                     common::analytics::ClassStats {
                         packets: client.packets_by_class[i],
@@ -137,54 +137,56 @@ impl AnalyticsManager {
                     }
                 });
 
-            // Build latency metrics
-            let latency = common::analytics::LatencyMetrics {
-                min_rtt_us: client.latency_stats.min_rtt_us,
-                max_rtt_us: client.latency_stats.max_rtt_us,
-                mean_rtt_us: client.latency_stats.mean_rtt_us(),
-                mean_jitter_us: client.latency_stats.mean_jitter_us(),
-                samples: client.latency_stats.count,
-            };
+                // Build latency metrics
+                let latency = common::analytics::LatencyMetrics {
+                    min_rtt_us: client.latency_stats.min_rtt_us,
+                    max_rtt_us: client.latency_stats.max_rtt_us,
+                    mean_rtt_us: client.latency_stats.mean_rtt_us(),
+                    mean_jitter_us: client.latency_stats.mean_jitter_us(),
+                    samples: client.latency_stats.count,
+                };
 
-            // Build loss metrics (aggregate across all classes)
-            let mut missing_seqs = 0u64;
-            let mut out_of_order = 0u64;
-            let mut duplicates = 0u64;
-            let mut total_gaps = 0usize;
+                // Build loss metrics (aggregate across all classes)
+                let mut missing_seqs = 0u64;
+                let mut out_of_order = 0u64;
+                let mut duplicates = 0u64;
+                let mut total_gaps = 0usize;
 
-            for tracker in &client.seq_trackers {
-                for gap in &tracker.missing_sequences {
-                    missing_seqs += (gap.end - gap.start + 1) as u64;
+                for tracker in &client.seq_trackers {
+                    for gap in &tracker.missing_sequences {
+                        missing_seqs += (gap.end - gap.start + 1) as u64;
+                    }
+                    total_gaps += tracker.missing_sequences.len();
+                    out_of_order += tracker.out_of_order_count;
+                    duplicates += tracker.duplicate_count;
                 }
-                total_gaps += tracker.missing_sequences.len();
-                out_of_order += tracker.out_of_order_count;
-                duplicates += tracker.duplicate_count;
-            }
 
-            let loss = common::analytics::LossMetrics {
-                missing_sequences: missing_seqs,
-                out_of_order,
-                duplicates,
-                total_gaps,
-            };
+                let loss = common::analytics::LossMetrics {
+                    missing_sequences: missing_seqs,
+                    out_of_order,
+                    duplicates,
+                    total_gaps,
+                };
 
-            // Build ClientStats
-            common::analytics::ClientStats {
-                addr: addr.to_string(),
-                first_seen_us: client.first_seen
-                    .duration_since(self.start_time)
-                    .as_micros() as u64,
-                last_seen_us: client.last_seen
-                    .duration_since(self.start_time)
-                    .as_micros() as u64,
-                session_duration_us: client.last_seen
-                    .duration_since(client.first_seen)
-                    .as_micros() as u64,
-                class_stats,
-                latency,
-                loss,
-            }
-        }).collect();
+                // Build ClientStats
+                common::analytics::ClientStats {
+                    addr: addr.to_string(),
+                    first_seen_us: client
+                        .first_seen
+                        .duration_since(self.start_time)
+                        .as_micros() as u64,
+                    last_seen_us: client.last_seen.duration_since(self.start_time).as_micros()
+                        as u64,
+                    session_duration_us: client
+                        .last_seen
+                        .duration_since(client.first_seen)
+                        .as_micros() as u64,
+                    class_stats,
+                    latency,
+                    loss,
+                }
+            })
+            .collect();
 
         // Build final snapshot
         common::analytics::AnalyticsSnapshot {
@@ -194,7 +196,6 @@ impl AnalyticsManager {
             per_client_stats,
         }
     }
-
 }
 
 /// State for a single client
@@ -293,7 +294,6 @@ impl SequenceTracker {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct MissingSeqRange {
     /// First missing sequence number
@@ -319,7 +319,7 @@ pub enum LossEvent {
 pub struct LatencyStats {
     /// Recent RTT samples (ring buffer, max 100)
     recent_rtts: VecDeque<u64>,
-    max_samples: usize,  // 100
+    max_samples: usize, // 100
 
     /// Min RTT ever seen
     min_rtt_us: u64, // Use u64::MAX as 'no sample yet' - check if it's still MAX
@@ -345,7 +345,7 @@ impl LatencyStats {
         Self {
             recent_rtts: VecDeque::new(),
             max_samples: 100,
-            min_rtt_us: u64::MAX,  // Sentinel value
+            min_rtt_us: u64::MAX, // Sentinel value
             max_rtt_us: 0,
             sum_rtt_us: 0,
             count: 0,
@@ -396,7 +396,7 @@ impl LatencyStats {
 /// Calculates packets/second over a sliding window
 pub struct RateCalculator {
     /// Size of the sliding window
-    window_duration: Duration,  // 5 seconds
+    window_duration: Duration, // 5 seconds
     /// 1-second buckets
     buckets: VecDeque<RateBucket>,
 }
@@ -405,7 +405,7 @@ impl RateCalculator {
     pub fn new(window_secs: u32) -> Self {
         RateCalculator {
             window_duration: Duration::from_secs(window_secs as u64),
-            buckets: VecDeque::new()
+            buckets: VecDeque::new(),
         }
     }
 
@@ -413,7 +413,7 @@ impl RateCalculator {
         // Clean up old buckets
         while let Some(front) = self.buckets.front() {
             if now - front.timestamp >= self.window_duration {
-                self.buckets.pop_front();  // Remove buckets older than 5s
+                self.buckets.pop_front(); // Remove buckets older than 5s
             } else {
                 break;
             }

@@ -1,13 +1,11 @@
+use common::{TrafficClass, WireMessage, analytics::AnalyticsSnapshot, make_data_packet};
+use crossterm::{ExecutableCommand, cursor, terminal};
 use std::{
     collections::{HashMap, VecDeque},
     io::{Error, Result, stdout},
     net::UdpSocket,
-    time::{Duration, Instant}
+    time::{Duration, Instant},
 };
-use common::{
-    TrafficClass, WireMessage, analytics::AnalyticsSnapshot, make_data_packet
-};
-use crossterm::{ExecutableCommand, cursor, terminal};
 
 #[derive(Clone, Copy)]
 pub struct ScheduledSend {
@@ -16,15 +14,10 @@ pub struct ScheduledSend {
     pub declared_bytes: u32,
 }
 
-pub enum SendMode {
-    Idle,
-    Continuous {
-        class: TrafficClass,
-        #[allow(dead_code)]
-        packets_per_second: u32,  // Reserved for displaying current rate
-        last_send: Instant,
-        interval: Duration,
-    },
+pub struct ContinuousState {
+    pub class: TrafficClass,
+    pub next_send_at: Instant, // track the absolute deadline for the next continuous packet.
+    pub interval: Duration,
 }
 
 pub struct ClientState {
@@ -37,7 +30,7 @@ pub struct ClientState {
     pub min_rtt: Duration,
     pub max_rtt: Duration,
     pub sum_rtt: Duration,
-    pub send_mode: SendMode,
+    pub continuous_state: Option<ContinuousState>,
 }
 
 impl ClientState {
@@ -57,7 +50,7 @@ impl ClientState {
             min_rtt: Duration::MAX,
             max_rtt: Duration::ZERO,
             sum_rtt: Duration::ZERO,
-            send_mode: SendMode::Idle,
+            continuous_state: None,
         }
     }
 }
@@ -119,11 +112,8 @@ pub fn schedule_burst(
     }
 }
 
-pub fn receive_acks(
-    state: &mut ClientState,
-    socket: &UdpSocket,
-) -> Result<()> {
-    let mut buf = [0u8; 8192];  // Large enough for both ACKs and analytics
+pub fn receive_acks(state: &mut ClientState, socket: &UdpSocket) -> Result<()> {
+    let mut buf = [0u8; 8192]; // Large enough for both ACKs and analytics
 
     loop {
         match socket.recv_from(&mut buf) {
@@ -175,19 +165,15 @@ pub fn send_continuous_packets(
     socket: &UdpSocket,
     server_addr: &str,
 ) -> Result<()> {
-    if let SendMode::Continuous { class, packets_per_second: _, last_send, interval } = &mut state.send_mode {
+    if let Some(s) = &mut state.continuous_state {
+        // use a fixed "now" snapshot and catch up missed intervals.
         let now = Instant::now();
 
-        let class_seq = state.next_class_seq.get(class).unwrap_or(&0);
+        while now >= s.next_send_at {
+            let class_seq = state.next_class_seq.get(&s.class).unwrap_or(&0);
 
-        if now.duration_since(*last_send) >= *interval {
-            // Send packet
-            let pkt = make_data_packet(
-                state.next_global_seq,
-                *class_seq,
-                *class,
-                1200,
-            );
+            // emit one packet per elapsed interval to preserve target rate.
+            let pkt = make_data_packet(state.next_global_seq, *class_seq, s.class, 1200);
             let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
             let send_time = Instant::now();
             socket.send_to(&bytes, server_addr)?;
@@ -195,9 +181,10 @@ pub fn send_continuous_packets(
             state.pending_acks.insert(state.next_global_seq, send_time);
             state.next_global_seq = state.next_global_seq.wrapping_add(1);
             let next_class_seq = class_seq.wrapping_add(1);
-            state.next_class_seq.insert(*class, next_class_seq);
+            state.next_class_seq.insert(s.class, next_class_seq);
 
-            *last_send = now;
+            // advance the schedule by exactly one interval (no drift).
+            s.next_send_at += s.interval;
         }
     }
 
@@ -206,20 +193,33 @@ pub fn send_continuous_packets(
 
 fn display_analytics(snapshot: &AnalyticsSnapshot) {
     use crossterm::{ExecutableCommand, cursor, terminal};
-    use std::io::{stdout, Write};
+    use std::io::{Write, stdout};
 
     let mut out = stdout();
     out.execute(cursor::SavePosition).ok();
     out.execute(cursor::MoveTo(0, 20)).ok();
-    out.execute(terminal::Clear(terminal::ClearType::FromCursorDown)).ok();
+    out.execute(terminal::Clear(terminal::ClearType::FromCursorDown))
+        .ok();
 
     // Build the entire output string first (use \r\n for raw mode)
     let mut output = String::new();
     output.push_str("=== Analytics Snapshot ===\r\n");
-    output.push_str(&format!("Server uptime: {:.2}s\r\n", snapshot.server_uptime_us as f64 / 1_000_000.0));
-    output.push_str(&format!("Total packets: {}\r\n", snapshot.global_stats.total_packets));
-    output.push_str(&format!("Total bytes: {}\r\n", snapshot.global_stats.total_bytes));
-    output.push_str(&format!("Unique clients: {}\r\n", snapshot.global_stats.unique_clients));
+    output.push_str(&format!(
+        "Server uptime: {:.2}s\r\n",
+        snapshot.server_uptime_us as f64 / 1_000_000.0
+    ));
+    output.push_str(&format!(
+        "Total packets: {}\r\n",
+        snapshot.global_stats.total_packets
+    ));
+    output.push_str(&format!(
+        "Total bytes: {}\r\n",
+        snapshot.global_stats.total_bytes
+    ));
+    output.push_str(&format!(
+        "Unique clients: {}\r\n",
+        snapshot.global_stats.unique_clients
+    ));
 
     output.push_str("\r\nPer-class breakdown:\r\n");
     let classes = ["Api", "HeavyCompute", "Background", "HealthCheck"];
@@ -227,26 +227,27 @@ fn display_analytics(snapshot: &AnalyticsSnapshot) {
         let pkts = snapshot.global_stats.packets_by_class[i];
         let bytes = snapshot.global_stats.bytes_by_class[i];
         if pkts > 0 {
-            output.push_str(&format!("  {}: {} packets, {} bytes\r\n", name, pkts, bytes));
+            output.push_str(&format!(
+                "  {}: {} packets, {} bytes\r\n",
+                name, pkts, bytes
+            ));
         }
     }
 
     if let Some(client) = snapshot.per_client_stats.first() {
         // Only show latency if we have actual samples (min_rtt != u64::MAX sentinel)
         if client.latency.samples > 0 && client.latency.min_rtt_us != u64::MAX {
-            output.push_str(&format!("\r\nLatency: min={}µs max={}µs avg={:.0}µs\r\n",
-                client.latency.min_rtt_us,
-                client.latency.max_rtt_us,
-                client.latency.mean_rtt_us
+            output.push_str(&format!(
+                "\r\nLatency: min={}µs max={}µs avg={:.0}µs\r\n",
+                client.latency.min_rtt_us, client.latency.max_rtt_us, client.latency.mean_rtt_us
             ));
         } else {
             output.push_str("\r\nLatency: (no RTT data collected by server)\r\n");
         }
 
-        output.push_str(&format!("Loss: {} missing, {} out-of-order, {} duplicates\r\n",
-            client.loss.missing_sequences,
-            client.loss.out_of_order,
-            client.loss.duplicates
+        output.push_str(&format!(
+            "Loss: {} missing, {} out-of-order, {} duplicates\r\n",
+            client.loss.missing_sequences, client.loss.out_of_order, client.loss.duplicates
         ));
     }
 

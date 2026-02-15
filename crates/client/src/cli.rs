@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{Result, Error, ErrorKind};
+use std::io::{Error, ErrorKind, Result};
 
 pub fn parse_server_addr_args() -> Result<String> {
     let mut server = String::from("127.0.0.1");

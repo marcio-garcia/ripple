@@ -1,7 +1,7 @@
-use std::{env, io::Result, net::UdpSocket, time::Instant};
-use std::io::{Error, ErrorKind};
-use common::WireMessage;
 use crate::analytics::AnalyticsManager;
+use common::WireMessage;
+use std::io::{Error, ErrorKind};
+use std::{env, io::Result, net::UdpSocket, time::Instant};
 
 pub mod analytics;
 
@@ -46,7 +46,7 @@ fn parse_bind_addr_args() -> Result<String> {
     Ok(format!("{server}:{port}"))
 }
 
-fn main() -> Result<()>{
+fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     println!("Program path: {}", args[0]);
     let server_addr = parse_bind_addr_args()?;
@@ -54,7 +54,7 @@ fn main() -> Result<()>{
     let socket = UdpSocket::bind(&server_addr).expect("Couldn't bind to socket");
     println!("Server listening on {}...", server_addr);
 
-    let mut analytics = AnalyticsManager::new(5, 1000);  // 5-sec window, max 1000 clients
+    let mut analytics = AnalyticsManager::new(5, 1000); // 5-sec window, max 1000 clients
     let mut buf = [0u8; 1024];
     let mut packet_count = 0;
 
@@ -76,10 +76,13 @@ fn main() -> Result<()>{
                 }
                 WireMessage::RequestAnalytics => {
                     let snapshot = analytics.export_snapshot();
-                    let analytics_bytes =
-                        encode_wire_message(&WireMessage::Analytics(snapshot))?;
+                    let analytics_bytes = encode_wire_message(&WireMessage::Analytics(snapshot))?;
                     socket.send_to(&analytics_bytes, src)?;
-                    println!("Analytics snapshot sent to {} ({} bytes)", src, analytics_bytes.len());
+                    println!(
+                        "Analytics snapshot sent to {} ({} bytes)",
+                        src,
+                        analytics_bytes.len()
+                    );
                 }
                 WireMessage::Ack(_) | WireMessage::Analytics(_) => {
                     println!("Ignoring unexpected server-side message from {}", src);

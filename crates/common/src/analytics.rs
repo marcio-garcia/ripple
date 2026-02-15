@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Top-level analytics snapshot sent to visualizer
 #[derive(Serialize, Deserialize, Debug, Clone)]
