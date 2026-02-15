@@ -16,7 +16,6 @@ use std::io::{Result, stdout};
 use std::net::UdpSocket;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 mod cli;
 mod input;
@@ -49,11 +48,15 @@ fn main() -> Result<()> {
     stdout.execute(MoveToNextLine(1))?;
     print!("Send to: {}", &server_addr);
     stdout.execute(MoveToNextLine(1))?;
-    print!("Commands: Space=send | B=burst | 1-9=count | I/E=src | K/L=dst | Q=quit");
+    print!(
+        "Commands: Space=send | B=burst | 1-9=count | I/E=src | K/L=dst | T/Y/U=topology tests | P=topology | Q=quit"
+    );
     stdout.execute(MoveToNextLine(1))?;
     print!("Mode: src=external dst=internal");
     stdout.execute(MoveToNextLine(1))?;
     print!("Stats: [waiting for ACKs...]");
+    stdout.execute(MoveToNextLine(1))?;
+    print!("Topology: [no snapshot yet]");
 
     let socket = open_socket().expect("Couldn't open socket");
     socket.set_nonblocking(true).expect("error on non blocking");

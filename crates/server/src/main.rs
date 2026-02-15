@@ -1,7 +1,12 @@
 use crate::analytics::AnalyticsManager;
 use common::WireMessage;
 use std::io::{Error, ErrorKind};
-use std::{env, io::Result, net::UdpSocket, time::Instant};
+use std::{
+    env,
+    io::Result,
+    net::UdpSocket,
+    time::{Duration, Instant},
+};
 
 pub mod analytics;
 pub mod client;
@@ -53,51 +58,78 @@ fn main() -> Result<()> {
     let server_addr = parse_bind_addr_args()?;
 
     let socket = UdpSocket::bind(&server_addr).expect("Couldn't bind to socket");
+    socket.set_read_timeout(Some(Duration::from_millis(250)))?;
     println!("Server listening on {}...", server_addr);
 
     let mut analytics = AnalyticsManager::new(5, 1000); // 5-sec window, max 1000 clients
-    let mut buf = [0u8; 1024];
-    let mut packet_count = 0;
+    let mut buf = [0u8; 65535];
+    let mut last_cleanup_at = Instant::now();
 
     loop {
-        let (amt, src) = socket.recv_from(&mut buf)?;
-
-        println!("Received {} bytes from {}", amt, src);
-
-        if let Ok(message) = common::decode_message(&buf[..amt]) {
-            match message {
-                WireMessage::Data(packet) => {
-                    let ack = analytics.on_packet_received(src, &packet, Instant::now());
-                    let ack_bytes = encode_wire_message(&WireMessage::Ack(ack))?;
-                    socket.send_to(&ack_bytes, src)?;
-                    println!(
-                        "seq={} class={} class_seq={} → ACK sent",
-                        packet.global_seq, packet.class, packet.class_seq
-                    );
-                }
-                WireMessage::RequestAnalytics => {
-                    let snapshot = analytics.export_snapshot();
-                    let analytics_bytes = encode_wire_message(&WireMessage::Analytics(snapshot))?;
-                    socket.send_to(&analytics_bytes, src)?;
-                    println!(
-                        "Analytics snapshot sent to {} ({} bytes)",
-                        src,
-                        analytics_bytes.len()
-                    );
-                }
-                WireMessage::Ack(_) | WireMessage::Analytics(_) => {
-                    println!("Ignoring unexpected server-side message from {}", src);
-                }
-            }
-        } else {
-            println!("Failed to decode packet from {}", src);
+        let now = Instant::now();
+        if now.duration_since(last_cleanup_at) >= Duration::from_secs(1) {
+            analytics.cleanup_stale(Duration::from_secs(60), Duration::from_secs(30), now);
+            last_cleanup_at = now;
         }
 
-        packet_count += 1;
-        if packet_count % 1000 == 0 {
-            use std::time::Duration;
-            analytics.cleanup_stale_clients(Duration::from_secs(60));
-            println!("Cleaned up stale clients");
+        match socket.recv_from(&mut buf) {
+            Ok((amt, src)) => {
+                println!("Received {} bytes from {}", amt, src);
+
+                if let Ok(message) = common::decode_message(&buf[..amt]) {
+                    match message {
+                        WireMessage::RegisterNode(packet) => {
+                            analytics.on_node_registered(&packet, src, Instant::now());
+                            println!("Registered node {:?}", packet.node_id);
+                        }
+                        WireMessage::UnregisterNode(packet) => {
+                            analytics.on_node_unregistered(&packet);
+                            println!("Unregistered node {:?}", packet.node_id);
+                        }
+                        WireMessage::Data(packet) => {
+                            let ack = analytics.on_packet_received(src, &packet, Instant::now());
+                            let ack_bytes = encode_wire_message(&WireMessage::Ack(ack))?;
+                            socket.send_to(&ack_bytes, src)?;
+                            println!(
+                                "seq={} class={} class_seq={} → ACK sent",
+                                packet.global_seq, packet.class, packet.class_seq
+                            );
+                        }
+                        WireMessage::RequestTopology => {
+                            let snapshot = analytics.export_topology_snapshot(Instant::now());
+                            let topology_bytes =
+                                encode_wire_message(&WireMessage::Topology(snapshot))?;
+                            socket.send_to(&topology_bytes, src)?;
+                            println!(
+                                "Topology snapshot sent to {} ({} bytes)",
+                                src,
+                                topology_bytes.len()
+                            );
+                        }
+                        WireMessage::RequestAnalytics => {
+                            let snapshot = analytics.export_snapshot();
+                            let analytics_bytes =
+                                encode_wire_message(&WireMessage::Analytics(snapshot))?;
+                            socket.send_to(&analytics_bytes, src)?;
+                            println!(
+                                "Analytics snapshot sent to {} ({} bytes)",
+                                src,
+                                analytics_bytes.len()
+                            );
+                        }
+                        WireMessage::Ack(_)
+                        | WireMessage::Analytics(_)
+                        | WireMessage::Topology(_) => {
+                            println!("Ignoring unexpected server-side message from {}", src);
+                        }
+                    }
+                } else {
+                    println!("Failed to decode packet from {}", src);
+                }
+            }
+            Err(err)
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {}
+            Err(err) => return Err(err),
         }
     }
 }

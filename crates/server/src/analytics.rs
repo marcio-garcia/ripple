@@ -1,37 +1,138 @@
-use common::{AckPacket, DataPacket, EndpointDomain, NodeId};
-use std::collections::HashMap;
+use crate::client::{LatencyStats, LossEvent, RateCalculator, SequenceTracker};
+use common::{
+    AckPacket, DataPacket, EdgeId, EndpointDomain, NodeDomain, NodeId, RegisterNodePacket,
+    TrafficClass, UnregisterNodePacket,
+};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::client::{Client, LossEvent};
-
-/// Main analytics engine tracking all clients and stats
+/// Main analytics engine tracking graph topology and aggregate stats.
 pub struct AnalyticsManager {
-    /// When the server started (for relative timestamps)
     start_time: Instant,
-
-    /// All connected clients, keyed by stable node id
-    clients: HashMap<NodeId, Client>,
-
-    /// Global counters
+    nodes: HashMap<NodeId, NodeState>,
+    edges: HashMap<EdgeKey, EdgeState>,
     total_packets: u64,
     total_bytes: u64,
     packets_by_class: [u64; 4],
     bytes_by_class: [u64; 4],
     route_packets: [u64; 4],
     route_bytes: [u64; 4],
-
-    /// Configuration
     rate_window_secs: u32,
-    #[allow(dead_code)]
-    max_clients: usize,
+    max_nodes: usize,
+    snapshot_seq: u64,
+    last_topology_epoch_us: u64,
+    removed_nodes_since_last_snapshot: Vec<NodeId>,
+    removed_edges_since_last_snapshot: Vec<EdgeId>,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+struct EdgeKey {
+    src_node_id: NodeId,
+    dst_node_id: NodeId,
+    class: TrafficClass,
+}
+
+struct NodeState {
+    node_id: NodeId,
+    desc: [u8; 16],
+    domain: NodeDomain,
+    addr: SocketAddr,
+    first_seen: Instant,
+    last_seen: Instant,
+    seq_trackers: [SequenceTracker; 4],
+    packets_by_class: [u64; 4],
+    bytes_by_class: [u64; 4],
+    route_packets: [u64; 4],
+    route_bytes: [u64; 4],
+    latency_stats: LatencyStats,
+    rate_calculators: [RateCalculator; 4],
+}
+
+impl NodeState {
+    fn new(
+        node_id: NodeId,
+        desc: [u8; 16],
+        domain: NodeDomain,
+        addr: SocketAddr,
+        now: Instant,
+        window_secs: u32,
+    ) -> Self {
+        Self {
+            node_id,
+            desc,
+            domain,
+            addr,
+            first_seen: now,
+            last_seen: now,
+            seq_trackers: Default::default(),
+            packets_by_class: [0; 4],
+            bytes_by_class: [0; 4],
+            route_packets: [0; 4],
+            route_bytes: [0; 4],
+            latency_stats: LatencyStats::new(),
+            rate_calculators: [
+                RateCalculator::new(window_secs),
+                RateCalculator::new(window_secs),
+                RateCalculator::new(window_secs),
+                RateCalculator::new(window_secs),
+            ],
+        }
+    }
+}
+
+struct EdgeState {
+    edge_id: EdgeId,
+    src_node_id: NodeId,
+    dst_node_id: NodeId,
+    class: TrafficClass,
+    last_seen: Instant,
+    packets: u64,
+    bytes: u64,
+    rate_calculator: RateCalculator,
+    seq_tracker: SequenceTracker,
+    prev_packets_per_second: f64,
+    prev_bytes_per_second: f64,
+    latency_ewma_us: f64,
+    jitter_ewma_us: f64,
+    latency_delta_us: f64,
+    last_latency_sample_us: Option<f64>,
+    window_packets: u64,
+    window_missing: u64,
+}
+
+impl EdgeState {
+    fn new(key: EdgeKey, now: Instant, window_secs: u32) -> Self {
+        Self {
+            edge_id: edge_id_from_key(key),
+            src_node_id: key.src_node_id,
+            dst_node_id: key.dst_node_id,
+            class: key.class,
+            last_seen: now,
+            packets: 0,
+            bytes: 0,
+            rate_calculator: RateCalculator::new(window_secs),
+            seq_tracker: SequenceTracker::default(),
+            prev_packets_per_second: 0.0,
+            prev_bytes_per_second: 0.0,
+            latency_ewma_us: 0.0,
+            jitter_ewma_us: 0.0,
+            latency_delta_us: 0.0,
+            last_latency_sample_us: None,
+            window_packets: 0,
+            window_missing: 0,
+        }
+    }
 }
 
 impl AnalyticsManager {
-    pub fn new(window_secs: u32, max_clients: usize) -> Self {
-        AnalyticsManager {
+    pub fn new(window_secs: u32, max_nodes: usize) -> Self {
+        let start_epoch_us = epoch_timestamp_us();
+        Self {
             start_time: Instant::now(),
-            clients: HashMap::new(),
+            nodes: HashMap::new(),
+            edges: HashMap::new(),
             total_packets: 0,
             total_bytes: 0,
             packets_by_class: [0; 4],
@@ -39,8 +140,43 @@ impl AnalyticsManager {
             route_packets: [0; 4],
             route_bytes: [0; 4],
             rate_window_secs: window_secs,
-            max_clients,
+            max_nodes,
+            snapshot_seq: 0,
+            last_topology_epoch_us: start_epoch_us,
+            removed_nodes_since_last_snapshot: Vec::new(),
+            removed_edges_since_last_snapshot: Vec::new(),
         }
+    }
+
+    pub fn on_node_registered(
+        &mut self,
+        packet: &RegisterNodePacket,
+        src: SocketAddr,
+        now: Instant,
+    ) {
+        if !self.nodes.contains_key(&packet.node_id) && self.nodes.len() >= self.max_nodes {
+            return;
+        }
+
+        let node = self.nodes.entry(packet.node_id).or_insert_with(|| {
+            NodeState::new(
+                packet.node_id,
+                packet.desc,
+                packet.domain,
+                src,
+                now,
+                self.rate_window_secs,
+            )
+        });
+
+        node.addr = src;
+        node.desc = packet.desc;
+        node.domain = packet.domain;
+        node.last_seen = now;
+    }
+
+    pub fn on_node_unregistered(&mut self, packet: &UnregisterNodePacket) {
+        self.remove_node_and_edges(packet.node_id);
     }
 
     pub fn on_packet_received(
@@ -49,16 +185,30 @@ impl AnalyticsManager {
         packet: &DataPacket,
         now: Instant,
     ) -> AckPacket {
-        let client = self.clients.entry(packet.node_id).or_insert_with(|| {
-            Client::new(packet.node_id, packet.desc, src, now, self.rate_window_secs)
-        });
-
-        client.last_seen = now;
-        client.addr = src;
-        client.desc = packet.desc;
-
+        let src_node_id = effective_src_node_id(packet);
+        let dst_node_id = effective_dst_node_id(packet);
+        let src_domain = NodeDomain::from(packet.src_domain);
+        let dst_domain = NodeDomain::from(packet.dst_domain);
         let class_idx = packet.class as usize;
         let route_idx = route_index(packet.src_domain, packet.dst_domain);
+
+        self.ensure_node(
+            src_node_id,
+            packet.desc,
+            src_domain,
+            src,
+            now,
+            packet.src_domain,
+        );
+        self.ensure_node(
+            dst_node_id,
+            domain_desc(packet.dst_domain),
+            dst_domain,
+            src,
+            now,
+            packet.dst_domain,
+        );
+
         self.total_packets += 1;
         self.total_bytes += packet.declared_bytes as u64;
         self.packets_by_class[class_idx] += 1;
@@ -66,27 +216,54 @@ impl AnalyticsManager {
         self.route_packets[route_idx] += 1;
         self.route_bytes[route_idx] += packet.declared_bytes as u64;
 
-        client.packets_by_class[class_idx] += 1;
-        client.bytes_by_class[class_idx] += packet.declared_bytes as u64;
-        client.route_packets[route_idx] += 1;
-        client.route_bytes[route_idx] += packet.declared_bytes as u64;
+        if let Some(node) = self.nodes.get_mut(&src_node_id) {
+            node.last_seen = now;
+            node.addr = src;
+            node.desc = packet.desc;
+            node.packets_by_class[class_idx] += 1;
+            node.bytes_by_class[class_idx] += packet.declared_bytes as u64;
+            node.route_packets[route_idx] += 1;
+            node.route_bytes[route_idx] += packet.declared_bytes as u64;
 
-        let loss_event = client.seq_trackers[class_idx].process_sequence(packet.class_seq, now);
-        if let LossEvent::Loss { count } = loss_event {
-            println!("Loss detected: {} packets missing", count);
+            let loss_event = node.seq_trackers[class_idx].process_sequence(packet.class_seq, now);
+            if let LossEvent::Loss { count } = loss_event {
+                println!("Loss detected on node {:?}: {} packets missing", src_node_id, count);
+            }
+
+            node.rate_calculators[class_idx].record_packet(now, packet.declared_bytes);
         }
 
-        client.rate_calculators[class_idx].record_packet(now, packet.declared_bytes);
+        if let Some(node) = self.nodes.get_mut(&dst_node_id) {
+            node.last_seen = now;
+        }
 
-        let server_timestamp_us = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_micros() as u64;
+        let key = EdgeKey {
+            src_node_id,
+            dst_node_id,
+            class: packet.class,
+        };
+        let edge = self
+            .edges
+            .entry(key)
+            .or_insert_with(|| EdgeState::new(key, now, self.rate_window_secs));
+        edge.last_seen = now;
+        edge.packets += 1;
+        edge.bytes += packet.declared_bytes as u64;
+        edge.window_packets += 1;
+        edge.rate_calculator.record_packet(now, packet.declared_bytes);
 
-        let client_timestamp_us = packet.timestamp_us;
-        if server_timestamp_us >= client_timestamp_us {
-            let latency_us = server_timestamp_us - client_timestamp_us;
-            client.latency_stats.add_rtt_sample(latency_us);
+        let edge_loss_event = edge.seq_tracker.process_sequence(packet.class_seq, now);
+        if let LossEvent::Loss { count } = edge_loss_event {
+            edge.window_missing += count;
+        }
+
+        let server_timestamp_us = epoch_timestamp_us();
+        if server_timestamp_us >= packet.timestamp_us {
+            let latency_us = (server_timestamp_us - packet.timestamp_us) as f64;
+            if let Some(src_node) = self.nodes.get_mut(&src_node_id) {
+                src_node.latency_stats.add_rtt_sample(latency_us as u64);
+            }
+            update_edge_latency(edge, latency_us);
         }
 
         AckPacket {
@@ -96,91 +273,146 @@ impl AnalyticsManager {
         }
     }
 
+    pub fn cleanup_stale(&mut self, node_ttl: Duration, edge_ttl: Duration, now: Instant) {
+        let stale_nodes: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| now.duration_since(node.last_seen) >= node_ttl)
+            .map(|(node_id, _)| *node_id)
+            .collect();
+
+        for node_id in stale_nodes {
+            self.remove_node_and_edges(node_id);
+        }
+
+        let stale_edges: Vec<EdgeKey> = self
+            .edges
+            .iter()
+            .filter(|(_, edge)| now.duration_since(edge.last_seen) >= edge_ttl)
+            .map(|(key, _)| *key)
+            .collect();
+
+        for key in stale_edges {
+            if let Some(edge) = self.edges.remove(&key) {
+                self.removed_edges_since_last_snapshot.push(edge.edge_id);
+            }
+        }
+    }
+
     pub fn cleanup_stale_clients(&mut self, timeout: Duration) {
-        let now = Instant::now();
-        self.clients
-            .retain(|_node_id, client| now.duration_since(client.last_seen) < timeout);
+        self.cleanup_stale(timeout, timeout, Instant::now());
+    }
+
+    pub fn export_topology_snapshot(
+        &mut self,
+        now: Instant,
+    ) -> common::analytics::TopologySnapshot {
+        self.snapshot_seq = self.snapshot_seq.saturating_add(1);
+        let snapshot_timestamp_epoch_us = epoch_timestamp_us();
+        let snapshot_interval_us =
+            snapshot_timestamp_epoch_us.saturating_sub(self.last_topology_epoch_us);
+        self.last_topology_epoch_us = snapshot_timestamp_epoch_us;
+        let activity_ttl = Duration::from_secs((self.rate_window_secs as u64).saturating_mul(3));
+
+        let nodes: Vec<_> = self
+            .nodes
+            .values()
+            .map(|node| {
+                let (total_pps, total_bps) = total_rate_for_node(node, now);
+                common::analytics::NodeSnapshot {
+                    node_id: node.node_id,
+                    desc: node.desc,
+                    domain: node.domain,
+                    first_seen_us: node.first_seen.duration_since(self.start_time).as_micros() as u64,
+                    last_seen_us: node.last_seen.duration_since(self.start_time).as_micros() as u64,
+                    active: now.duration_since(node.last_seen) < activity_ttl,
+                    total_packets: node.packets_by_class.iter().sum(),
+                    total_bytes: node.bytes_by_class.iter().sum(),
+                    total_pps,
+                    total_bps,
+                    latency: latency_metrics_from_stats(&node.latency_stats),
+                    loss: loss_metrics_from_trackers(&node.seq_trackers),
+                }
+            })
+            .collect();
+
+        let mut edges: Vec<common::analytics::EdgeSnapshot> = Vec::with_capacity(self.edges.len());
+        for edge in self.edges.values_mut() {
+            let (pps, bps) = edge.rate_calculator.calculate_rate(now);
+            let delta_pps = pps - edge.prev_packets_per_second;
+            let delta_bps = bps - edge.prev_bytes_per_second;
+            edge.prev_packets_per_second = pps;
+            edge.prev_bytes_per_second = bps;
+            let loss_rate_window = if edge.window_packets == 0 {
+                0.0
+            } else {
+                edge.window_missing as f64 / edge.window_packets as f64
+            };
+            edge.window_packets = 0;
+            edge.window_missing = 0;
+
+            edges.push(common::analytics::EdgeSnapshot {
+                edge_id: edge.edge_id,
+                src_node_id: edge.src_node_id,
+                dst_node_id: edge.dst_node_id,
+                class: edge.class,
+                packets: edge.packets,
+                bytes: edge.bytes,
+                packets_per_second: pps,
+                bytes_per_second: bps,
+                delta_packets_per_second: delta_pps,
+                delta_bytes_per_second: delta_bps,
+                latency_ewma_us: edge.latency_ewma_us,
+                latency_delta_us: edge.latency_delta_us,
+                jitter_ewma_us: edge.jitter_ewma_us,
+                loss_rate_window,
+                active: now.duration_since(edge.last_seen) < activity_ttl,
+            });
+        }
+
+        common::analytics::TopologySnapshot {
+            snapshot_seq: self.snapshot_seq,
+            snapshot_timestamp_epoch_us,
+            snapshot_interval_us,
+            nodes,
+            edges,
+            removed_nodes: std::mem::take(&mut self.removed_nodes_since_last_snapshot),
+            removed_edges: std::mem::take(&mut self.removed_edges_since_last_snapshot),
+            global_stats: self.global_stats(),
+        }
     }
 
     pub fn export_snapshot(&self) -> common::analytics::AnalyticsSnapshot {
         let now = Instant::now();
         let uptime = now.duration_since(self.start_time).as_micros() as u64;
-
-        let global_stats = common::analytics::GlobalStats {
-            total_packets: self.total_packets,
-            total_bytes: self.total_bytes,
-            packets_by_class: self.packets_by_class,
-            bytes_by_class: self.bytes_by_class,
-            route_stats: std::array::from_fn(|i| common::analytics::RouteStats {
-                packets: self.route_packets[i],
-                bytes: self.route_bytes[i],
-            }),
-            unique_clients: self.clients.len(),
-        };
-
-        let per_client_stats: Vec<_> = self
-            .clients
+        let per_client_stats = self
+            .nodes
             .values()
-            .map(|client| {
+            .map(|node| {
                 let class_stats: [common::analytics::ClassStats; 4] = std::array::from_fn(|i| {
-                    let (pps, bps) = client.rate_calculators[i].calculate_rate(now);
+                    let (pps, bps) = node.rate_calculators[i].calculate_rate(now);
                     common::analytics::ClassStats {
-                        packets: client.packets_by_class[i],
-                        bytes: client.bytes_by_class[i],
+                        packets: node.packets_by_class[i],
+                        bytes: node.bytes_by_class[i],
                         packets_per_second: pps,
                         bytes_per_second: bps,
                     }
                 });
 
-                let latency = common::analytics::LatencyMetrics {
-                    min_rtt_us: client.latency_stats.min_rtt_us,
-                    max_rtt_us: client.latency_stats.max_rtt_us,
-                    mean_rtt_us: client.latency_stats.mean_rtt_us(),
-                    mean_jitter_us: client.latency_stats.mean_jitter_us(),
-                    samples: client.latency_stats.count,
-                };
-
-                let mut missing_seqs = 0u64;
-                let mut out_of_order = 0u64;
-                let mut duplicates = 0u64;
-                let mut total_gaps = 0usize;
-
-                for tracker in &client.seq_trackers {
-                    for gap in &tracker.missing_sequences {
-                        missing_seqs += (gap.end - gap.start + 1) as u64;
-                    }
-                    total_gaps += tracker.missing_sequences.len();
-                    out_of_order += tracker.out_of_order_count;
-                    duplicates += tracker.duplicate_count;
-                }
-
-                let loss = common::analytics::LossMetrics {
-                    missing_sequences: missing_seqs,
-                    out_of_order,
-                    duplicates,
-                    total_gaps,
-                };
-
                 common::analytics::ClientStats {
-                    node_id: client.node_id,
-                    desc: client.desc,
-                    addr: client.addr.to_string(),
-                    first_seen_us: client
-                        .first_seen
-                        .duration_since(self.start_time)
-                        .as_micros() as u64,
-                    last_seen_us: client.last_seen.duration_since(self.start_time).as_micros()
+                    node_id: node.node_id,
+                    desc: node.desc,
+                    addr: node.addr.to_string(),
+                    first_seen_us: node.first_seen.duration_since(self.start_time).as_micros() as u64,
+                    last_seen_us: node.last_seen.duration_since(self.start_time).as_micros() as u64,
+                    session_duration_us: node.last_seen.duration_since(node.first_seen).as_micros()
                         as u64,
-                    session_duration_us: client
-                        .last_seen
-                        .duration_since(client.first_seen)
-                        .as_micros() as u64,
                     class_stats,
-                    latency,
-                    loss,
+                    latency: latency_metrics_from_stats(&node.latency_stats),
+                    loss: loss_metrics_from_trackers(&node.seq_trackers),
                     route_stats: std::array::from_fn(|i| common::analytics::RouteStats {
-                        packets: client.route_packets[i],
-                        bytes: client.route_bytes[i],
+                        packets: node.route_packets[i],
+                        bytes: node.route_bytes[i],
                     }),
                 }
             })
@@ -189,9 +421,144 @@ impl AnalyticsManager {
         common::analytics::AnalyticsSnapshot {
             snapshot_timestamp_us: uptime,
             server_uptime_us: uptime,
-            global_stats,
+            global_stats: self.global_stats(),
             per_client_stats,
         }
+    }
+
+    fn ensure_node(
+        &mut self,
+        node_id: NodeId,
+        desc: [u8; 16],
+        domain: NodeDomain,
+        addr: SocketAddr,
+        now: Instant,
+        fallback_domain: EndpointDomain,
+    ) {
+        if !self.nodes.contains_key(&node_id) && self.nodes.len() >= self.max_nodes {
+            return;
+        }
+
+        let node = self.nodes.entry(node_id).or_insert_with(|| {
+            NodeState::new(
+                node_id,
+                desc,
+                domain,
+                addr,
+                now,
+                self.rate_window_secs,
+            )
+        });
+
+        node.desc = desc;
+        node.addr = addr;
+        node.last_seen = now;
+        if node.node_id == common::synthetic_domain_node_id(fallback_domain) {
+            node.domain = NodeDomain::from(fallback_domain);
+        }
+    }
+
+    fn remove_node_and_edges(&mut self, node_id: NodeId) {
+        if self.nodes.remove(&node_id).is_none() {
+            return;
+        }
+
+        self.removed_nodes_since_last_snapshot.push(node_id);
+        let mut removed_edge_ids = HashSet::new();
+        let to_remove: Vec<EdgeKey> = self
+            .edges
+            .iter()
+            .filter(|(_, edge)| edge.src_node_id == node_id || edge.dst_node_id == node_id)
+            .map(|(key, _)| *key)
+            .collect();
+
+        for key in to_remove {
+            if let Some(edge) = self.edges.remove(&key) {
+                removed_edge_ids.insert(edge.edge_id);
+            }
+        }
+
+        self.removed_edges_since_last_snapshot
+            .extend(removed_edge_ids);
+    }
+
+    fn global_stats(&self) -> common::analytics::GlobalStats {
+        common::analytics::GlobalStats {
+            total_packets: self.total_packets,
+            total_bytes: self.total_bytes,
+            packets_by_class: self.packets_by_class,
+            bytes_by_class: self.bytes_by_class,
+            route_stats: std::array::from_fn(|i| common::analytics::RouteStats {
+                packets: self.route_packets[i],
+                bytes: self.route_bytes[i],
+            }),
+            unique_clients: self.nodes.len(),
+        }
+    }
+}
+
+fn total_rate_for_node(node: &NodeState, now: Instant) -> (f64, f64) {
+    node.rate_calculators.iter().fold((0.0, 0.0), |acc, calc| {
+        let (pps, bps) = calc.calculate_rate(now);
+        (acc.0 + pps, acc.1 + bps)
+    })
+}
+
+fn latency_metrics_from_stats(latency_stats: &LatencyStats) -> common::analytics::LatencyMetrics {
+    common::analytics::LatencyMetrics {
+        min_rtt_us: latency_stats.min_rtt_us,
+        max_rtt_us: latency_stats.max_rtt_us,
+        mean_rtt_us: latency_stats.mean_rtt_us(),
+        mean_jitter_us: latency_stats.mean_jitter_us(),
+        samples: latency_stats.count,
+    }
+}
+
+fn loss_metrics_from_trackers(
+    seq_trackers: &[SequenceTracker; 4],
+) -> common::analytics::LossMetrics {
+    let mut missing_seqs = 0u64;
+    let mut out_of_order = 0u64;
+    let mut duplicates = 0u64;
+    let mut total_gaps = 0usize;
+
+    for tracker in seq_trackers {
+        for gap in &tracker.missing_sequences {
+            missing_seqs += (gap.end - gap.start + 1) as u64;
+        }
+        total_gaps += tracker.missing_sequences.len();
+        out_of_order += tracker.out_of_order_count;
+        duplicates += tracker.duplicate_count;
+    }
+
+    common::analytics::LossMetrics {
+        missing_sequences: missing_seqs,
+        out_of_order,
+        duplicates,
+        total_gaps,
+    }
+}
+
+fn effective_src_node_id(packet: &DataPacket) -> NodeId {
+    if packet.src_node_id != [0; 16] {
+        packet.src_node_id
+    } else {
+        packet.node_id
+    }
+}
+
+fn effective_dst_node_id(packet: &DataPacket) -> NodeId {
+    if packet.dst_node_id != [0; 16] {
+        packet.dst_node_id
+    } else {
+        common::synthetic_domain_node_id(packet.dst_domain)
+    }
+}
+
+fn domain_desc(domain: EndpointDomain) -> [u8; 16] {
+    match domain {
+        EndpointDomain::Internal => *b"internal-node---",
+        EndpointDomain::External => *b"external-node---",
     }
 }
 
@@ -201,5 +568,115 @@ fn route_index(src_domain: EndpointDomain, dst_domain: EndpointDomain) -> usize 
         (EndpointDomain::Internal, EndpointDomain::External) => 1,
         (EndpointDomain::External, EndpointDomain::Internal) => 2,
         (EndpointDomain::External, EndpointDomain::External) => 3,
+    }
+}
+
+fn update_edge_latency(edge: &mut EdgeState, latency_us: f64) {
+    const LATENCY_ALPHA: f64 = 0.2;
+    const JITTER_ALPHA: f64 = 0.2;
+
+    if edge.latency_ewma_us == 0.0 {
+        edge.latency_ewma_us = latency_us;
+    } else {
+        edge.latency_ewma_us =
+            LATENCY_ALPHA * latency_us + (1.0 - LATENCY_ALPHA) * edge.latency_ewma_us;
+    }
+
+    if let Some(prev) = edge.last_latency_sample_us {
+        let jitter_sample = (latency_us - prev).abs();
+        if edge.jitter_ewma_us == 0.0 {
+            edge.jitter_ewma_us = jitter_sample;
+        } else {
+            edge.jitter_ewma_us =
+                JITTER_ALPHA * jitter_sample + (1.0 - JITTER_ALPHA) * edge.jitter_ewma_us;
+        }
+    }
+
+    edge.latency_delta_us = latency_us - edge.latency_ewma_us;
+    edge.last_latency_sample_us = Some(latency_us);
+}
+
+fn edge_id_from_key(key: EdgeKey) -> EdgeId {
+    let mut first = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut first);
+    let first_hash = first.finish();
+
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    0x9E37_79B9_7F4A_7C15u64.hash(&mut second);
+    key.hash(&mut second);
+    let second_hash = second.finish();
+
+    let mut edge_id = [0u8; 16];
+    edge_id[..8].copy_from_slice(&first_hash.to_be_bytes());
+    edge_id[8..].copy_from_slice(&second_hash.to_be_bytes());
+    edge_id
+}
+
+fn epoch_timestamp_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("System time before UNIX epoch")
+        .as_micros() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnalyticsManager;
+    use common::{EndpointDomain, NodeDomain, TrafficClass, WireMessage};
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::time::Instant;
+
+    #[test]
+    fn request_topology_wire_roundtrip_includes_graph_state() {
+        let mut analytics = AnalyticsManager::new(5, 100);
+        let now = Instant::now();
+        let node_id = *b"NODE-ALPHA-00001";
+        let desc = *b"probe-node------";
+        let addr = SocketAddr::from_str("127.0.0.1:41001").expect("valid socket");
+
+        let register = common::make_register_node_packet(node_id, desc, NodeDomain::Internal);
+        analytics.on_node_registered(&register, addr, now);
+
+        let packet = common::make_data_packet(
+            node_id,
+            1,
+            1,
+            TrafficClass::Api,
+            1200,
+            EndpointDomain::Internal,
+            EndpointDomain::External,
+            desc,
+        );
+        let ack = analytics.on_packet_received(addr, &packet, now);
+        assert_eq!(ack.original_seq, 1);
+
+        let req_bytes =
+            common::encode_message(&WireMessage::RequestTopology).expect("request should encode");
+        let req = common::decode_message(&req_bytes).expect("request should decode");
+        let response = match req {
+            WireMessage::RequestTopology => {
+                WireMessage::Topology(analytics.export_topology_snapshot(Instant::now()))
+            }
+            _ => panic!("expected topology request"),
+        };
+
+        let res_bytes = common::encode_message(&response).expect("response should encode");
+        let decoded = common::decode_message(&res_bytes).expect("response should decode");
+        match decoded {
+            WireMessage::Topology(snapshot) => {
+                assert!(snapshot.snapshot_seq >= 1);
+                assert_eq!(snapshot.global_stats.total_packets, 1);
+                assert!(snapshot.nodes.iter().any(|n| n.node_id == node_id));
+                assert!(!snapshot.edges.is_empty());
+                assert!(
+                    snapshot
+                        .edges
+                        .iter()
+                        .any(|e| e.src_node_id == node_id && e.class == TrafficClass::Api)
+                );
+            }
+            _ => panic!("expected topology response"),
+        }
     }
 }

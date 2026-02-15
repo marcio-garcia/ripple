@@ -1,6 +1,7 @@
 use common::{
-    NodeId, EndpointDomain, TrafficClass, WireMessage, analytics::AnalyticsSnapshot,
-    make_data_packet,
+    EndpointDomain, NodeDomain, NodeId, TrafficClass, WireMessage,
+    analytics::{AnalyticsSnapshot, TopologySnapshot},
+    make_data_packet, make_register_node_packet, make_unregister_node_packet,
 };
 use crossterm::{ExecutableCommand, cursor, terminal};
 use std::{
@@ -38,6 +39,7 @@ pub struct ClientState {
     pub max_rtt: Duration,
     pub sum_rtt: Duration,
     pub continuous_state: Option<ContinuousState>,
+    pub pending_topology_expectation: Option<TopologyExpectation>,
 }
 
 impl ClientState {
@@ -62,12 +64,149 @@ impl ClientState {
             max_rtt: Duration::ZERO,
             sum_rtt: Duration::ZERO,
             continuous_state: None,
+            pending_topology_expectation: None,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum TopologyExpectation {
+    Smoke { node_id: NodeId },
+    Removal { node_id: NodeId },
+    MixedClasses { node_id: NodeId },
+}
+
 fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
     common::encode_message(message).map_err(Error::other)
+}
+
+fn send_data_packet(
+    state: &mut ClientState,
+    socket: &UdpSocket,
+    server_addr: &str,
+    class: TrafficClass,
+    declared_bytes: u32,
+    src_domain: EndpointDomain,
+    dst_domain: EndpointDomain,
+) -> Result<()> {
+    let class_seq = state.next_class_seq.get(&class).unwrap_or(&0);
+    let pkt = make_data_packet(
+        state.node_id,
+        state.next_global_seq,
+        *class_seq,
+        class,
+        declared_bytes,
+        src_domain,
+        dst_domain,
+        state.desc,
+    );
+    let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
+    let send_time = Instant::now();
+    socket.send_to(&bytes, server_addr)?;
+
+    state.pending_acks.insert(state.next_global_seq, send_time);
+    state.next_global_seq = state.next_global_seq.wrapping_add(1);
+    state.next_class_seq.insert(class, class_seq.wrapping_add(1));
+    Ok(())
+}
+
+fn send_register_node(
+    state: &ClientState,
+    socket: &UdpSocket,
+    server_addr: &str,
+    domain: NodeDomain,
+) -> Result<()> {
+    let pkt = make_register_node_packet(state.node_id, state.desc, domain);
+    let bytes = encode_wire_message(&WireMessage::RegisterNode(pkt))?;
+    socket.send_to(&bytes, server_addr)?;
+    Ok(())
+}
+
+fn send_unregister_node(state: &ClientState, socket: &UdpSocket, server_addr: &str) -> Result<()> {
+    let pkt = make_unregister_node_packet(state.node_id);
+    let bytes = encode_wire_message(&WireMessage::UnregisterNode(pkt))?;
+    socket.send_to(&bytes, server_addr)?;
+    Ok(())
+}
+
+pub fn request_topology(socket: &UdpSocket, server_addr: &str) -> Result<()> {
+    let pkt = encode_wire_message(&WireMessage::RequestTopology)?;
+    socket.send_to(&pkt, server_addr)?;
+    Ok(())
+}
+
+pub fn run_topology_smoke_test(
+    state: &mut ClientState,
+    socket: &UdpSocket,
+    server_addr: &str,
+) -> Result<()> {
+    state.queue.clear();
+    state.continuous_state = None;
+    send_register_node(state, socket, server_addr, NodeDomain::Internal)?;
+    send_data_packet(
+        state,
+        socket,
+        server_addr,
+        TrafficClass::Api,
+        1200,
+        EndpointDomain::Internal,
+        EndpointDomain::External,
+    )?;
+    request_topology(socket, server_addr)?;
+    state.pending_topology_expectation = Some(TopologyExpectation::Smoke {
+        node_id: state.node_id,
+    });
+    render_topology_status("Topology smoke test dispatched (awaiting snapshot)")?;
+    Ok(())
+}
+
+pub fn run_topology_removal_test(
+    state: &mut ClientState,
+    socket: &UdpSocket,
+    server_addr: &str,
+) -> Result<()> {
+    state.queue.clear();
+    state.continuous_state = None;
+    send_register_node(state, socket, server_addr, NodeDomain::Internal)?;
+    send_unregister_node(state, socket, server_addr)?;
+    request_topology(socket, server_addr)?;
+    state.pending_topology_expectation = Some(TopologyExpectation::Removal {
+        node_id: state.node_id,
+    });
+    render_topology_status("Topology removal test dispatched (awaiting snapshot)")?;
+    Ok(())
+}
+
+pub fn run_topology_mixed_classes_test(
+    state: &mut ClientState,
+    socket: &UdpSocket,
+    server_addr: &str,
+) -> Result<()> {
+    state.queue.clear();
+    state.continuous_state = None;
+    send_register_node(state, socket, server_addr, NodeDomain::Internal)?;
+    for class in [
+        TrafficClass::Api,
+        TrafficClass::HeavyCompute,
+        TrafficClass::Background,
+        TrafficClass::HealthCheck,
+    ] {
+        send_data_packet(
+            state,
+            socket,
+            server_addr,
+            class,
+            1200,
+            EndpointDomain::Internal,
+            EndpointDomain::External,
+        )?;
+    }
+    request_topology(socket, server_addr)?;
+    state.pending_topology_expectation = Some(TopologyExpectation::MixedClasses {
+        node_id: state.node_id,
+    });
+    render_topology_status("Topology mixed-classes test dispatched (awaiting snapshot)")?;
+    Ok(())
 }
 
 pub fn send_scheduled_packets(
@@ -84,26 +223,15 @@ pub fn send_scheduled_packets(
 
         state.queue.pop_front();
 
-        let class_seq = state.next_class_seq.get(&front.class).unwrap_or(&0);
-
-        let pkt = make_data_packet(
-            state.node_id,
-            state.next_global_seq,
-            *class_seq,
+        send_data_packet(
+            state,
+            socket,
+            server_addr,
             front.class,
             front.declared_bytes,
             state.src_domain,
             state.dst_domain,
-            state.desc,
-        );
-        let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
-        let send_time = Instant::now();
-        socket.send_to(&bytes, server_addr)?;
-
-        state.pending_acks.insert(state.next_global_seq, send_time);
-        state.next_global_seq = state.next_global_seq.wrapping_add(1);
-        let next_class_seq = class_seq.wrapping_add(1);
-        state.next_class_seq.insert(front.class, next_class_seq);
+        )?;
     }
 
     Ok(())
@@ -160,7 +288,14 @@ pub fn receive_acks(state: &mut ClientState, socket: &UdpSocket) -> Result<()> {
                             }
                         }
                         WireMessage::Analytics(snapshot) => display_analytics(&snapshot),
-                        WireMessage::Data(_) | WireMessage::RequestAnalytics => {}
+                        WireMessage::Topology(snapshot) => {
+                            display_topology_snapshot(state, &snapshot)?;
+                        }
+                        WireMessage::Data(_)
+                        | WireMessage::RequestAnalytics
+                        | WireMessage::RegisterNode(_)
+                        | WireMessage::UnregisterNode(_)
+                        | WireMessage::RequestTopology => {}
                     }
                 }
             }
@@ -180,31 +315,27 @@ pub fn send_continuous_packets(
     socket: &UdpSocket,
     server_addr: &str,
 ) -> Result<()> {
-    if let Some(s) = &mut state.continuous_state {
-        let now = Instant::now();
+    while let Some((class, next_send_at, interval)) = state
+        .continuous_state
+        .as_ref()
+        .map(|s| (s.class, s.next_send_at, s.interval))
+    {
+        if Instant::now() < next_send_at {
+            break;
+        }
 
-        while now >= s.next_send_at {
-            let class_seq = state.next_class_seq.get(&s.class).unwrap_or(&0);
+        send_data_packet(
+            state,
+            socket,
+            server_addr,
+            class,
+            1200,
+            state.src_domain,
+            state.dst_domain,
+        )?;
 
-            let pkt = make_data_packet(
-                state.node_id,
-                state.next_global_seq,
-                *class_seq,
-                s.class,
-                1200,
-                state.src_domain,
-                state.dst_domain,
-                state.desc,
-            );
-            let bytes = encode_wire_message(&WireMessage::Data(pkt))?;
-            let send_time = Instant::now();
-            socket.send_to(&bytes, server_addr)?;
-
-            state.pending_acks.insert(state.next_global_seq, send_time);
-            state.next_global_seq = state.next_global_seq.wrapping_add(1);
-            let next_class_seq = class_seq.wrapping_add(1);
-            state.next_class_seq.insert(s.class, next_class_seq);
-            s.next_send_at += s.interval;
+        if let Some(s) = state.continuous_state.as_mut() {
+            s.next_send_at += interval;
         }
     }
 
@@ -292,6 +423,102 @@ fn display_analytics(snapshot: &AnalyticsSnapshot) {
     print!("{}", output);
     out.flush().ok();
     out.execute(cursor::RestorePosition).ok();
+}
+
+fn display_topology_snapshot(state: &mut ClientState, snapshot: &TopologySnapshot) -> Result<()> {
+    let base = format!(
+        "Topology: seq={} nodes={} edges={} packets={}",
+        snapshot.snapshot_seq,
+        snapshot.nodes.len(),
+        snapshot.edges.len(),
+        snapshot.global_stats.total_packets
+    );
+
+    let status = if let Some(expectation) = state.pending_topology_expectation.take() {
+        validate_topology_expectation(expectation, snapshot)
+    } else {
+        format!("{base} (no active test)")
+    };
+
+    render_topology_status(&status)
+}
+
+fn validate_topology_expectation(
+    expectation: TopologyExpectation,
+    snapshot: &TopologySnapshot,
+) -> String {
+    match expectation {
+        TopologyExpectation::Smoke { node_id } => {
+            let node_present = snapshot.nodes.iter().any(|node| node.node_id == node_id);
+            let edge_present = snapshot
+                .edges
+                .iter()
+                .any(|edge| edge.src_node_id == node_id);
+            let looks_like_external_target = snapshot
+                .nodes
+                .iter()
+                .any(|node| node.domain == NodeDomain::External);
+            let pass = node_present && edge_present && looks_like_external_target;
+            format!(
+                "Topology smoke [{}]: node={} edge={} external_node={} nodes={} edges={} packets={}",
+                pass_label(pass),
+                yes_no(node_present),
+                yes_no(edge_present),
+                yes_no(looks_like_external_target),
+                snapshot.nodes.len(),
+                snapshot.edges.len(),
+                snapshot.global_stats.total_packets
+            )
+        }
+        TopologyExpectation::Removal { node_id } => {
+            let removed = snapshot.removed_nodes.contains(&node_id);
+            format!(
+                "Topology removal [{}]: removed_node={} removed_nodes={} removed_edges={}",
+                pass_label(removed),
+                yes_no(removed),
+                snapshot.removed_nodes.len(),
+                snapshot.removed_edges.len()
+            )
+        }
+        TopologyExpectation::MixedClasses { node_id } => {
+            let classes = [
+                TrafficClass::Api,
+                TrafficClass::HeavyCompute,
+                TrafficClass::Background,
+                TrafficClass::HealthCheck,
+            ];
+            let all_classes_present = classes.iter().all(|class| {
+                snapshot
+                    .edges
+                    .iter()
+                    .any(|edge| edge.src_node_id == node_id && edge.class == *class)
+            });
+            format!(
+                "Topology mixed-classes [{}]: class_edges_found={} edges={}",
+                pass_label(all_classes_present),
+                yes_no(all_classes_present),
+                snapshot.edges.len()
+            )
+        }
+    }
+}
+
+fn render_topology_status(message: &str) -> Result<()> {
+    let mut out = stdout();
+    out.execute(cursor::SavePosition)?;
+    out.execute(cursor::MoveTo(0, 5))?;
+    out.execute(terminal::Clear(terminal::ClearType::CurrentLine))?;
+    print!("{message}");
+    out.execute(cursor::RestorePosition)?;
+    Ok(())
+}
+
+fn pass_label(pass: bool) -> &'static str {
+    if pass { "PASS" } else { "FAIL" }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn format_node_id_as_uuid(node_id: &[u8; 16]) -> String {

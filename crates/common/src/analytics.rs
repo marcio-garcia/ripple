@@ -1,4 +1,68 @@
+use crate::{EdgeId, NodeDomain, NodeId, TrafficClass};
 use serde::{Deserialize, Serialize};
+
+/// Graph-first snapshot for force-directed topology visualizers.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TopologySnapshot {
+    /// Monotonic sequence so consumers can detect dropped snapshots.
+    pub snapshot_seq: u64,
+
+    /// Absolute wall-clock timestamp (microseconds since UNIX epoch).
+    pub snapshot_timestamp_epoch_us: u64,
+
+    /// Time since the previous snapshot in microseconds.
+    pub snapshot_interval_us: u64,
+
+    /// Active nodes at snapshot time.
+    pub nodes: Vec<NodeSnapshot>,
+
+    /// Active edges at snapshot time.
+    pub edges: Vec<EdgeSnapshot>,
+
+    /// Nodes removed since the previous topology snapshot.
+    pub removed_nodes: Vec<NodeId>,
+
+    /// Edges removed since the previous topology snapshot.
+    pub removed_edges: Vec<EdgeId>,
+
+    /// Global aggregate statistics (kept for dashboard/summary views).
+    pub global_stats: GlobalStats,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeSnapshot {
+    pub node_id: NodeId,
+    pub desc: [u8; 16],
+    pub domain: NodeDomain,
+    pub first_seen_us: u64,
+    pub last_seen_us: u64,
+    pub active: bool,
+    pub total_packets: u64,
+    pub total_bytes: u64,
+    pub total_pps: f64,
+    pub total_bps: f64,
+    pub latency: LatencyMetrics,
+    pub loss: LossMetrics,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EdgeSnapshot {
+    pub edge_id: EdgeId,
+    pub src_node_id: NodeId,
+    pub dst_node_id: NodeId,
+    pub class: TrafficClass,
+    pub packets: u64,
+    pub bytes: u64,
+    pub packets_per_second: f64,
+    pub bytes_per_second: f64,
+    pub delta_packets_per_second: f64,
+    pub delta_bytes_per_second: f64,
+    pub latency_ewma_us: f64,
+    pub latency_delta_us: f64,
+    pub jitter_ewma_us: f64,
+    pub loss_rate_window: f64,
+    pub active: bool,
+}
 
 /// Top-level analytics snapshot sent to visualizer
 #[derive(Serialize, Deserialize, Debug, Clone)]

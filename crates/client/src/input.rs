@@ -1,4 +1,7 @@
-use crate::transmission::{ClientState, ContinuousState, schedule_burst};
+use crate::transmission::{
+    ClientState, ContinuousState, request_topology, run_topology_mixed_classes_test,
+    run_topology_removal_test, run_topology_smoke_test, schedule_burst,
+};
 use common::{EndpointDomain, TrafficClass, WireMessage};
 use crossterm::event::KeyCode;
 use std::io::Error;
@@ -15,6 +18,10 @@ pub enum InputCommand {
     StartContinuous { class: TrafficClass, rate: u32 },
     StopContinuous,
     RequestAnalytics,
+    RequestTopology,
+    RunTopologySmokeTest,
+    RunTopologyRemovalTest,
+    RunTopologyMixedClassesTest,
     SetSourceDomain(EndpointDomain),
     SetDestinationDomain(EndpointDomain),
 }
@@ -42,6 +49,10 @@ pub fn handle_input(key: KeyCode) -> Option<InputCommand> {
             }),
             's' => Some(InputCommand::StopContinuous),
             'r' => Some(InputCommand::RequestAnalytics),
+            'p' => Some(InputCommand::RequestTopology),
+            't' => Some(InputCommand::RunTopologySmokeTest),
+            'y' => Some(InputCommand::RunTopologyRemovalTest),
+            'u' => Some(InputCommand::RunTopologyMixedClassesTest),
             'i' => Some(InputCommand::SetSourceDomain(EndpointDomain::Internal)),
             'e' => Some(InputCommand::SetSourceDomain(EndpointDomain::External)),
             'k' => Some(InputCommand::SetDestinationDomain(EndpointDomain::Internal)),
@@ -108,6 +119,23 @@ pub fn execute_command(
                 common::encode_message(&WireMessage::RequestAnalytics).map_err(Error::other)?;
             socket.send_to(&pkt, server_addr)?;
             print!("Requesting analytics...");
+            Ok(())
+        }
+        InputCommand::RequestTopology => {
+            request_topology(socket, server_addr)?;
+            print!("Requesting topology...");
+            Ok(())
+        }
+        InputCommand::RunTopologySmokeTest => {
+            run_topology_smoke_test(state, socket, server_addr)?;
+            Ok(())
+        }
+        InputCommand::RunTopologyRemovalTest => {
+            run_topology_removal_test(state, socket, server_addr)?;
+            Ok(())
+        }
+        InputCommand::RunTopologyMixedClassesTest => {
+            run_topology_mixed_classes_test(state, socket, server_addr)?;
             Ok(())
         }
         InputCommand::SetSourceDomain(domain) => {
